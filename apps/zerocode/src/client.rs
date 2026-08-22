@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
@@ -420,6 +420,51 @@ fn clone_connection_state(state: &Mutex<ConnectionState>) -> ConnectionState {
     }
 }
 
+/// Record the first terminal transport failure and wake every pending RPC.
+fn record_disconnect(
+    state: &Arc<Mutex<ConnectionState>>,
+    rpc: &Arc<RpcOutbound>,
+    reason: impl Into<String>,
+) {
+    let reason = reason.into();
+    let terminal_reason = {
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        match &*state {
+            ConnectionState::Connected => {
+                *state = ConnectionState::Disconnected {
+                    reason: reason.clone(),
+                };
+                reason
+            }
+            ConnectionState::Disconnected { reason } => reason.clone(),
+        }
+    };
+    rpc.fail_all_pending(JsonRpcError {
+        code: jsonrpc::error_codes::INTERNAL_ERROR,
+        message: terminal_reason,
+        data: None,
+    });
+}
+
+async fn write_local_frames<W>(
+    mut writer: W,
+    mut writer_rx: mpsc::Receiver<String>,
+    state: Arc<Mutex<ConnectionState>>,
+    rpc: Arc<RpcOutbound>,
+) where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(mut line) = writer_rx.recv().await {
+        if !line.ends_with('\n') {
+            line.push('\n');
+        }
+        if let Err(error) = writer.write_all(line.as_bytes()).await {
+            record_disconnect(&state, &rpc, format!("write failed: {error}"));
+            break;
+        }
+    }
+}
+
 /// The TUI and daemon are built from the same package version and do not
 /// promise cross-version wire compatibility.
 #[derive(Debug)]
@@ -666,27 +711,21 @@ impl RpcClient {
             .with_context(|| format!("connecting to {}", socket.display()))?;
         let (read_half, write_half) = tokio::io::split(stream);
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        tokio::spawn(async move {
-            let mut w = write_half;
-            while let Some(mut line) = writer_rx.recv().await {
-                if !line.ends_with('\n') {
-                    line.push('\n');
-                }
-                if w.write_all(line.as_bytes()).await.is_err() {
-                    break;
-                }
-            }
-        });
-
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
+        tokio::spawn(write_local_frames(
+            write_half,
+            writer_rx,
+            Arc::clone(&conn_state),
+            Arc::clone(&rpc),
+        ));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
         let notif_tx_for_reader = notif_tx.clone();
         let (inbound_tx, _) =
             broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
         let inbound_tx_for_reader = inbound_tx.clone();
 
-        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
         let conn_state_for_reader = conn_state.clone();
 
         let rpc_for_reader = rpc.clone();
@@ -697,21 +736,15 @@ impl RpcClient {
                 buf.clear();
                 match reader.read_line(&mut buf).await {
                     Ok(0) => {
-                        replace_connection_state(
+                        record_disconnect(
                             &conn_state_for_reader,
-                            ConnectionState::Disconnected {
-                                reason: "EOF (daemon closed connection)".to_string(),
-                            },
+                            &rpc_for_reader,
+                            "EOF (daemon closed connection)",
                         );
                         break;
                     }
                     Err(e) => {
-                        replace_connection_state(
-                            &conn_state_for_reader,
-                            ConnectionState::Disconnected {
-                                reason: e.to_string(),
-                            },
-                        );
+                        record_disconnect(&conn_state_for_reader, &rpc_for_reader, e.to_string());
                         break;
                     }
                     Ok(_) => {}
@@ -821,22 +854,28 @@ impl RpcClient {
         let (mut sink, mut stream) = ws_stream.split();
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
+        let rpc = Arc::new(jsonrpc::RpcOutbound::new(writer_tx));
+        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
+        let conn_state_for_writer = Arc::clone(&conn_state);
+        let rpc_for_writer = Arc::clone(&rpc);
         tokio::spawn(async move {
             while let Some(line) = writer_rx.recv().await {
-                if sink.send(Message::Text(line.into())).await.is_err() {
+                if let Err(error) = sink.send(Message::Text(line.into())).await {
+                    record_disconnect(
+                        &conn_state_for_writer,
+                        &rpc_for_writer,
+                        format!("WSS write failed: {error}"),
+                    );
                     break;
                 }
             }
         });
-
-        let rpc = Arc::new(jsonrpc::RpcOutbound::new(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
         let notif_tx_for_reader = notif_tx.clone();
         let (inbound_tx, _) =
             broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
         let inbound_tx_for_reader = inbound_tx.clone();
 
-        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
         let conn_state_for_reader = conn_state.clone();
 
         let rpc_for_reader = rpc.clone();
@@ -859,29 +898,20 @@ impl RpcClient {
                         let reason = frame
                             .map(|f| f.reason.to_string())
                             .unwrap_or_else(|| "server closed connection".to_string());
-                        replace_connection_state(
-                            &conn_state_for_reader,
-                            ConnectionState::Disconnected { reason },
-                        );
+                        record_disconnect(&conn_state_for_reader, &rpc_for_reader, reason);
                         break;
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
                     Some(Ok(Message::Binary(_))) => continue,
                     Some(Err(e)) => {
-                        replace_connection_state(
-                            &conn_state_for_reader,
-                            ConnectionState::Disconnected {
-                                reason: e.to_string(),
-                            },
-                        );
+                        record_disconnect(&conn_state_for_reader, &rpc_for_reader, e.to_string());
                         break;
                     }
                     None => {
-                        replace_connection_state(
+                        record_disconnect(
                             &conn_state_for_reader,
-                            ConnectionState::Disconnected {
-                                reason: "EOF (WSS connection closed)".to_string(),
-                            },
+                            &rpc_for_reader,
+                            "EOF (WSS connection closed)",
                         );
                         break;
                     }
@@ -1937,6 +1967,69 @@ mod initialize_timeout_tests {
 
         assert!(err.downcast_ref::<DaemonInitializeTimeout>().is_some());
         receiver.abort();
+    }
+}
+
+#[cfg(test)]
+mod writer_disconnect_tests {
+    use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct FailingWriter;
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "test writer closed",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_failure_disconnects_and_wakes_pending_request() {
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(1);
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let state = Arc::new(Mutex::new(ConnectionState::Connected));
+        let request_rpc = Arc::clone(&rpc);
+        let request = tokio::spawn(async move {
+            request_rpc
+                .request("session/new", serde_json::json!({}))
+                .await
+        });
+
+        write_local_frames(
+            FailingWriter,
+            writer_rx,
+            Arc::clone(&state),
+            Arc::clone(&rpc),
+        )
+        .await;
+
+        let error = request
+            .await
+            .expect("request task should complete")
+            .expect_err("writer failure should fail the pending request");
+        assert!(error.message.contains("write failed: test writer closed"));
+        assert!(matches!(
+            &*state.lock().unwrap_or_else(|e| e.into_inner()),
+            ConnectionState::Disconnected { reason }
+                if reason.contains("write failed: test writer closed")
+        ));
     }
 }
 
