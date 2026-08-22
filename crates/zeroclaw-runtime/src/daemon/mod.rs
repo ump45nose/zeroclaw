@@ -2913,16 +2913,11 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let handle = spawn_component_supervisor(
-            "daemon-test-error-chain",
-            60,
-            60,
-            cancel,
-            || async {
+        let handle =
+            spawn_component_supervisor("daemon-test-error-chain", 60, 60, cancel, || async {
                 Err(anyhow::Error::msg("provider entry has no model")
                     .context("agents.ox.model_provider"))
-            },
-        );
+            });
 
         let expected_chain = "agents.ox.model_provider: provider entry has no model";
         let expected_message =
