@@ -3822,7 +3822,8 @@ mod tests {
 
     #[test]
     fn streaming_api_error_extracts_message_from_stringified_error_envelope() {
-        let message = "anthropic error: Message: fetch failed Cause: AggregateError Name: TypeError";
+        let message =
+            "anthropic error: Message: fetch failed Cause: AggregateError Name: TypeError";
         let body = serde_json::json!({
             "status": "failure",
             "message": message,
@@ -3837,8 +3838,8 @@ mod tests {
         })
         .to_string();
 
-        let error = streaming_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &body)
-            .to_string();
+        let error =
+            streaming_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &body).to_string();
 
         assert_eq!(error, format!("500 Internal Server Error: {message}"));
     }
