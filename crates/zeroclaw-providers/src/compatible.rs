@@ -3841,7 +3841,10 @@ mod tests {
         let error =
             streaming_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &body).to_string();
 
-        assert_eq!(error, format!("500 Internal Server Error: {message}"));
+        assert_eq!(
+            error,
+            format!("ModelProvider error: 500 Internal Server Error: {message}")
+        );
     }
 
     fn make_model_provider(
