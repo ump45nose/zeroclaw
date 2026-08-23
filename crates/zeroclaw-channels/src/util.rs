@@ -29,6 +29,16 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Returns the largest UTF-8 character boundary at or before `max_bytes`.
+///
+/// This compatibility wrapper preserves the previously exported helper while
+/// directing new callers to the standard-library implementation.
+#[deprecated(since = "0.8.4", note = "use str::floor_char_boundary instead")]
+pub fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
+    // Keep downstream callers source-compatible without retaining duplicate boundary logic.
+    s.floor_char_boundary(max_bytes)
+}
+
 #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
 pub(crate) async fn read_response_body_limited(
     mut response: reqwest::Response,
@@ -516,6 +526,16 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verifies the exported compatibility wrapper retains the legacy UTF-8 boundary contract.
+    #[allow(deprecated)]
+    #[test]
+    fn floor_char_boundary_compatibility_wrapper_delegates_to_std() {
+        let text = "abc😀def";
+
+        assert_eq!(floor_char_boundary(text, 5), 3);
+        assert_eq!(floor_char_boundary(text, usize::MAX), text.len());
+    }
 
     #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
     async fn response_from_raw_http(

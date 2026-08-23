@@ -18,6 +18,16 @@ static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid image path regex")
 });
 
+/// Returns the largest UTF-8 character boundary at or before `index`.
+///
+/// This compatibility wrapper preserves the previously exported helper while
+/// directing new callers to the standard-library implementation.
+#[deprecated(since = "0.8.4", note = "use str::floor_char_boundary instead")]
+pub fn floor_char_boundary(s: &str, index: usize) -> usize {
+    // Keep downstream callers source-compatible without retaining duplicate boundary logic.
+    s.floor_char_boundary(index)
+}
+
 /// Indicates which side of a truncated string a boundary belongs to when
 /// nudging it away from a half-cut `[IMAGE:...]` marker.
 #[derive(Clone, Copy)]
@@ -422,6 +432,16 @@ pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verifies the exported compatibility wrapper retains the legacy UTF-8 boundary contract.
+    #[allow(deprecated)]
+    #[test]
+    fn floor_char_boundary_compatibility_wrapper_delegates_to_std() {
+        let text = "abc😀def";
+
+        assert_eq!(floor_char_boundary(text, 5), 3);
+        assert_eq!(floor_char_boundary(text, usize::MAX), text.len());
+    }
 
     #[test]
     fn estimate_system_floor_counts_only_system_messages() {
