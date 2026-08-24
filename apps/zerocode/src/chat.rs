@@ -13119,10 +13119,9 @@ mod tests {
             .input_bar
             .open_file_explorer_for_test(oversized_path.clone());
 
-        assert!(state.handle_input_bar_overlay_key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
+        assert!(
+            state.handle_input_bar_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,))
+        );
         assert!(
             state
                 .info_message
