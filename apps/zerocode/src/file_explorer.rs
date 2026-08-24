@@ -102,6 +102,13 @@ impl FileExplorerState {
         state
     }
 
+    /// Seed a file selection for an input-bar integration test without relying
+    /// on the host machine's interactive directory listing.
+    #[cfg(test)]
+    pub(crate) fn select_path_for_test(&mut self, path: PathBuf) {
+        self.selected.insert(path);
+    }
+
     pub fn new_dir_picker_remote(start_dir: PathBuf, rpc: Arc<crate::client::RpcClient>) -> Self {
         let mut state = Self {
             cwd: start_dir,

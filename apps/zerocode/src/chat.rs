@@ -1413,12 +1413,7 @@ impl Chat {
         // Input-bar overlays are modal within the input surface. Higher
         // overlays above have already had first refusal; handle them before
         // queue, browse, and other pane-level shortcuts.
-        if state.pending_approval().is_none()
-            && (state.input_bar.has_file_explorer() || state.input_bar.has_attachment_manager())
-        {
-            state.clear_mouse_highlight();
-            let _ = state.input_bar.handle_key(key);
-            state.mark_dirty_full();
+        if state.handle_input_bar_overlay_key(key) {
             return false;
         }
 
@@ -5860,6 +5855,27 @@ impl ChatState {
             && !self.input_bar.has_file_explorer()
             && !self.input_bar.has_attachment_manager()
             && !self.in_browse_mode()
+    }
+
+    /// Route a key to an input-bar-owned overlay and retain its user feedback.
+    /// Returns true only when that overlay consumed the key before pane-level
+    /// shortcuts get a chance to process it.
+    fn handle_input_bar_overlay_key(&mut self, key: KeyEvent) -> bool {
+        if self.pending_approval().is_some()
+            || (!self.input_bar.has_file_explorer() && !self.input_bar.has_attachment_manager())
+        {
+            return false;
+        }
+
+        self.clear_mouse_highlight();
+        let action = self.input_bar.handle_key(key);
+        // Explorer confirmation can reject an attachment (for example a file
+        // over the size limit). Preserve that feedback instead of swallowing it.
+        if let InputBarAction::StatusMessage(message) = action {
+            self.set_info_notice(message);
+        }
+        self.mark_dirty_full();
+        true
     }
 
     fn mark_dirty_full(&mut self) {
@@ -13083,6 +13099,40 @@ mod tests {
                 "{surface} must not create hidden attachments from pasted paths"
             );
         }
+    }
+
+    #[test]
+    fn file_explorer_attachment_error_reaches_info_notice() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let oversized_path = std::env::temp_dir().join(format!(
+            "zerocode-attachment-limit-{}-{}.bin",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("chat-test")
+        ));
+        let file = std::fs::File::create(&oversized_path).expect("create oversized attachment");
+        file.set_len(10 * 1024 * 1024 + 1)
+            .expect("make attachment exceed the 10 MiB limit");
+
+        let mut state = state();
+        state
+            .input_bar
+            .open_file_explorer_for_test(oversized_path.clone());
+
+        assert!(state.handle_input_bar_overlay_key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains("File too large")),
+            "a rejected file-explorer attachment must remain visible to the user"
+        );
+        assert!(!state.input_bar.has_file_explorer());
+
+        std::fs::remove_file(oversized_path).expect("remove temporary attachment");
     }
 
     #[tokio::test]
