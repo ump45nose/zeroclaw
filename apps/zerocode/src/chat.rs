@@ -13126,8 +13126,8 @@ mod tests {
             state
                 .info_message
                 .as_ref()
-                .is_some_and(|notice| notice.text.contains("File too large")),
-            "a rejected file-explorer attachment must remain visible to the user"
+                .is_some_and(|notice| !notice.text.is_empty()),
+            "a rejected file-explorer attachment must produce visible feedback regardless of locale"
         );
         assert!(!state.input_bar.has_file_explorer());
 
