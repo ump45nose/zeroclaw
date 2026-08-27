@@ -13105,11 +13105,10 @@ mod tests {
     fn file_explorer_attachment_error_reaches_info_notice() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
-        let oversized_path = std::env::temp_dir().join(format!(
-            "zerocode-attachment-limit-{}-{}.bin",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("chat-test")
-        ));
+        // Keep the explorer listing deterministic and let the guard clean up
+        // the oversized fixture even when an assertion fails.
+        let temp_dir = tempfile::tempdir().expect("create attachment fixture directory");
+        let oversized_path = temp_dir.path().join("oversized.bin");
         let file = std::fs::File::create(&oversized_path).expect("create oversized attachment");
         file.set_len(10 * 1024 * 1024 + 1)
             .expect("make attachment exceed the 10 MiB limit");
@@ -13130,8 +13129,6 @@ mod tests {
             "a rejected file-explorer attachment must produce visible feedback regardless of locale"
         );
         assert!(!state.input_bar.has_file_explorer());
-
-        std::fs::remove_file(oversized_path).expect("remove temporary attachment");
     }
 
     #[tokio::test]
