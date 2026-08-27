@@ -3258,7 +3258,7 @@ impl ModelProvider for ReliableModelProvider {
                 served_model.clone(),
                 ProviderDispatch::from_ref(model_provider).stream_chat(
                     req,
-                    &current_model,
+                    &served_model,
                     temperature,
                     options,
                 ),
@@ -3348,7 +3348,7 @@ impl ModelProvider for ReliableModelProvider {
                 ProviderDispatch::from_ref(model_provider).stream_chat_with_system(
                     system_prompt,
                     message,
-                    &current_model,
+                    &served_model,
                     temperature,
                     options,
                 ),
@@ -3429,7 +3429,7 @@ impl ModelProvider for ReliableModelProvider {
                 served_model.clone(),
                 ProviderDispatch::from_ref(model_provider).stream_chat_with_history(
                     messages,
-                    &current_model,
+                    &served_model,
                     temperature,
                     options,
                 ),
