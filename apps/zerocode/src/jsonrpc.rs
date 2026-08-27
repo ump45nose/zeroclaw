@@ -203,7 +203,7 @@ impl RpcOutbound {
     ) -> std::result::Result<Value, JsonRpcError> {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = format!("{OUTBOUND_ID_PREFIX}{n}");
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(error) = &pending.terminal_error {
@@ -226,14 +226,27 @@ impl RpcOutbound {
                 });
             }
         };
-        if self.writer_tx.send(body).await.is_err() {
-            return Err(JsonRpcError {
-                code: error_codes::INTERNAL_ERROR,
-                message: "Writer task closed".to_string(),
-                data: None,
-            });
-        }
-        rx.await.unwrap_or_else(|_| {
+        // The writer queue can remain full while the reader independently
+        // observes EOF. Race the queue send against the registered responder
+        // so a terminal transport error can cancel an unsent request.
+        let early_response = tokio::select! {
+            response = &mut rx => Some(response),
+            send_result = self.writer_tx.send(body) => {
+                if send_result.is_err() {
+                    return Err(JsonRpcError {
+                        code: error_codes::INTERNAL_ERROR,
+                        message: "Writer task closed".to_string(),
+                        data: None,
+                    });
+                }
+                None
+            }
+        };
+        let response = match early_response {
+            Some(response) => response,
+            None => rx.await,
+        };
+        response.unwrap_or_else(|_| {
             Err(JsonRpcError {
                 code: error_codes::INTERNAL_ERROR,
                 message: "Outbound RPC dropped".to_string(),
@@ -342,6 +355,57 @@ mod tests {
         .expect("request after disconnect should fail immediately")
         .expect_err("disconnected transport should reject new requests");
         assert_eq!(late_error.message, "daemon disconnected");
+        assert!(matches!(
+            writer_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// Proves a terminal transport error interrupts a request blocked on a full writer queue.
+    #[tokio::test]
+    async fn transport_failure_interrupts_request_blocked_on_full_writer_queue() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(1);
+        writer_tx
+            .send("occupied".to_string())
+            .await
+            .expect("writer queue should accept the prefilled frame");
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let request_rpc = Arc::clone(&rpc);
+        let request = tokio::spawn(async move {
+            request_rpc
+                .request("session/new", serde_json::json!({}))
+                .await
+        });
+
+        // Wait until the request has registered its responder and is blocked
+        // behind the prefilled frame without draining the live receiver.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while rpc.pending_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request should register while the writer queue stays full");
+
+        rpc.fail_all_pending(JsonRpcError {
+            code: error_codes::INTERNAL_ERROR,
+            message: "daemon disconnected".to_string(),
+            data: None,
+        });
+
+        let error = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .expect("blocked request should wake without a free writer slot")
+            .expect("request task should complete")
+            .expect_err("disconnection should fail the blocked request");
+        assert_eq!(error.message, "daemon disconnected");
+        assert_eq!(rpc.pending_count(), 0);
+        assert_eq!(
+            writer_rx
+                .try_recv()
+                .expect("prefilled frame should still occupy the queue"),
+            "occupied"
+        );
         assert!(matches!(
             writer_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)

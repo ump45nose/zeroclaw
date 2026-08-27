@@ -406,13 +406,6 @@ pub enum ConnectionState {
     Disconnected { reason: String },
 }
 
-fn replace_connection_state(state: &Mutex<ConnectionState>, next: ConnectionState) {
-    match state.lock() {
-        Ok(mut state) => *state = next,
-        Err(poisoned) => *poisoned.into_inner() = next,
-    }
-}
-
 fn clone_connection_state(state: &Mutex<ConnectionState>) -> ConnectionState {
     match state.lock() {
         Ok(state) => state.clone(),
