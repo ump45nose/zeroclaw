@@ -458,6 +458,27 @@ async fn write_local_frames<W>(
     }
 }
 
+/// Forward queued JSON-RPC frames to a WebSocket sink until the queue closes or writing fails.
+async fn write_wss_frames<S>(
+    mut sink: S,
+    mut writer_rx: mpsc::Receiver<String>,
+    state: Arc<Mutex<ConnectionState>>,
+    rpc: Arc<RpcOutbound>,
+) where
+    S: futures_util::Sink<tokio_tungstenite::tungstenite::Message> + Unpin,
+    S::Error: fmt::Display,
+{
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    while let Some(line) = writer_rx.recv().await {
+        if let Err(error) = sink.send(Message::Text(line.into())).await {
+            record_disconnect(&state, &rpc, format!("WSS write failed: {error}"));
+            break;
+        }
+    }
+}
+
 /// The TUI and daemon are built from the same package version and do not
 /// promise cross-version wire compatibility.
 #[derive(Debug)]
@@ -662,10 +683,30 @@ fn route_inbound_frame(
     }
 }
 
+/// Aborts a detached transport writer when its owning RPC client is dropped.
+#[derive(Debug)]
+struct AbortTaskOnDrop(tokio::task::AbortHandle);
+
+impl AbortTaskOnDrop {
+    /// Bind the lifetime of a spawned writer task to its owning client.
+    fn new(handle: tokio::task::AbortHandle) -> Self {
+        Self(handle)
+    }
+}
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        // Reconnect replaces the old client after reader-side EOF/Close; aborting
+        // here releases the old receiver, socket/TLS write half, and RpcOutbound.
+        self.0.abort();
+    }
+}
+
 #[derive(Debug)]
 pub struct RpcClient {
     pub(crate) rpc: Arc<RpcOutbound>,
     _read_task: tokio::task::JoinHandle<()>,
+    _writer_task: AbortTaskOnDrop,
     _router_task: tokio::task::JoinHandle<()>,
     pub server_version: String,
     /// OS process ID reported by the daemon during initialize.
@@ -707,12 +748,13 @@ impl RpcClient {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
-        tokio::spawn(write_local_frames(
+        let writer_task = tokio::spawn(write_local_frames(
             write_half,
             writer_rx,
             Arc::clone(&conn_state),
             Arc::clone(&rpc),
         ));
+        let writer_task = AbortTaskOnDrop::new(writer_task.abort_handle());
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
         let notif_tx_for_reader = notif_tx.clone();
         let (inbound_tx, _) =
@@ -802,6 +844,7 @@ impl RpcClient {
         Ok(Self {
             rpc,
             _read_task: read_task,
+            _writer_task: writer_task,
             _router_task: router_task,
             server_version: init.server_version,
             server_pid: init.server_pid,
@@ -828,7 +871,7 @@ impl RpcClient {
         prev_tui_sig: Option<&str>,
         tls_skip_verify: bool,
     ) -> Result<Self> {
-        use futures_util::{SinkExt, StreamExt};
+        use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message;
 
         let connector = if tls_skip_verify {
@@ -844,25 +887,18 @@ impl RpcClient {
                 .await
                 .with_context(|| format!("WSS connect to {url}"))?;
 
-        let (mut sink, mut stream) = ws_stream.split();
+        let (sink, mut stream) = ws_stream.split();
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
         let rpc = Arc::new(jsonrpc::RpcOutbound::new(writer_tx));
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
-        let conn_state_for_writer = Arc::clone(&conn_state);
-        let rpc_for_writer = Arc::clone(&rpc);
-        tokio::spawn(async move {
-            while let Some(line) = writer_rx.recv().await {
-                if let Err(error) = sink.send(Message::Text(line.into())).await {
-                    record_disconnect(
-                        &conn_state_for_writer,
-                        &rpc_for_writer,
-                        format!("WSS write failed: {error}"),
-                    );
-                    break;
-                }
-            }
-        });
+        let writer_task = tokio::spawn(write_wss_frames(
+            sink,
+            writer_rx,
+            Arc::clone(&conn_state),
+            Arc::clone(&rpc),
+        ));
+        let writer_task = AbortTaskOnDrop::new(writer_task.abort_handle());
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
         let notif_tx_for_reader = notif_tx.clone();
         let (inbound_tx, _) =
@@ -956,6 +992,7 @@ impl RpcClient {
         Ok(Self {
             rpc,
             _read_task: read_task,
+            _writer_task: writer_task,
             _router_task: router_task,
             server_version: init.server_version,
             server_pid: init.server_pid,
@@ -1815,9 +1852,11 @@ impl RpcClient {
     pub fn with_rpc(outbound: Arc<RpcOutbound>) -> Self {
         let (notif_tx, _) = tokio::sync::broadcast::channel(1);
         let (inbound_tx, _) = tokio::sync::broadcast::channel(1);
+        let writer_task = tokio::spawn(async {});
         Self {
             rpc: outbound,
             _read_task: tokio::spawn(async {}),
+            _writer_task: AbortTaskOnDrop::new(writer_task.abort_handle()),
             _router_task: tokio::spawn(async {}),
             server_version: "test".to_string(),
             server_pid: None,
@@ -1993,6 +2032,38 @@ mod writer_disconnect_tests {
         }
     }
 
+    /// Assert reader-first disconnect cleanup aborts the writer owned by a replaced client.
+    async fn assert_client_drop_releases_writer(
+        transport: Transport,
+        disconnect_reason: &str,
+        writer_task: tokio::task::JoinHandle<()>,
+        writer_probe: mpsc::Sender<String>,
+        rpc: Arc<RpcOutbound>,
+        state: Arc<Mutex<ConnectionState>>,
+    ) {
+        let mut client = RpcClient::with_rpc(Arc::clone(&rpc));
+        client.transport = transport;
+        client.connection_state = Arc::clone(&state);
+        client._writer_task = AbortTaskOnDrop::new(writer_task.abort_handle());
+
+        tokio::task::yield_now().await;
+        assert!(!writer_task.is_finished());
+        assert!(!writer_probe.is_closed());
+
+        // Model the reader reaching EOF/Close before the app replaces the client.
+        record_disconnect(&state, &rpc, disconnect_reason);
+        drop(client);
+
+        let join_error = tokio::time::timeout(Duration::from_secs(1), writer_task)
+            .await
+            .expect("writer task should stop when its client is dropped")
+            .expect_err("writer task should be aborted, not left parked");
+        assert!(join_error.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), writer_probe.closed())
+            .await
+            .expect("dropping the client should close the writer receiver");
+    }
+
     #[tokio::test]
     async fn writer_failure_disconnects_and_wakes_pending_request() {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(1);
@@ -2023,6 +2094,56 @@ mod writer_disconnect_tests {
             ConnectionState::Disconnected { reason }
                 if reason.contains("write failed: test writer closed")
         ));
+    }
+
+    /// Covers the local reader-EOF ordering that previously retained the write half.
+    #[tokio::test]
+    async fn local_reader_eof_then_client_drop_releases_writer() {
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(1);
+        let writer_probe = writer_tx.clone();
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let state = Arc::new(Mutex::new(ConnectionState::Connected));
+        let writer_task = tokio::spawn(write_local_frames(
+            tokio::io::sink(),
+            writer_rx,
+            Arc::clone(&state),
+            Arc::clone(&rpc),
+        ));
+
+        assert_client_drop_releases_writer(
+            Transport::Local,
+            "EOF (daemon closed connection)",
+            writer_task,
+            writer_probe,
+            rpc,
+            state,
+        )
+        .await;
+    }
+
+    /// Covers the WSS reader-Close ordering that previously retained the TLS sink.
+    #[tokio::test]
+    async fn wss_reader_close_then_client_drop_releases_writer() {
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(1);
+        let writer_probe = writer_tx.clone();
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let state = Arc::new(Mutex::new(ConnectionState::Connected));
+        let writer_task = tokio::spawn(write_wss_frames(
+            futures_util::sink::drain(),
+            writer_rx,
+            Arc::clone(&state),
+            Arc::clone(&rpc),
+        ));
+
+        assert_client_drop_releases_writer(
+            Transport::Wss,
+            "server closed connection",
+            writer_task,
+            writer_probe,
+            rpc,
+            state,
+        )
+        .await;
     }
 }
 
