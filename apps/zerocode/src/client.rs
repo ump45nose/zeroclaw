@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
@@ -420,6 +420,31 @@ fn clone_connection_state(state: &Mutex<ConnectionState>) -> ConnectionState {
     }
 }
 
+/// Forward local JSON-RPC frames to the socket and publish writer failures to
+/// the same connection state observed by the TUI reconnect loop.
+async fn drive_local_writer<W>(
+    mut writer: W,
+    mut writer_rx: mpsc::Receiver<String>,
+    connection_state: Arc<Mutex<ConnectionState>>,
+) where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(mut line) = writer_rx.recv().await {
+        if !line.ends_with('\n') {
+            line.push('\n');
+        }
+        if let Err(error) = writer.write_all(line.as_bytes()).await {
+            replace_connection_state(
+                &connection_state,
+                ConnectionState::Disconnected {
+                    reason: format!("writer: {error}"),
+                },
+            );
+            break;
+        }
+    }
+}
+
 /// The TUI and daemon are built from the same package version and do not
 /// promise cross-version wire compatibility.
 #[derive(Debug)]
@@ -666,18 +691,14 @@ impl RpcClient {
             .with_context(|| format!("connecting to {}", socket.display()))?;
         let (read_half, write_half) = tokio::io::split(stream);
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        tokio::spawn(async move {
-            let mut w = write_half;
-            while let Some(mut line) = writer_rx.recv().await {
-                if !line.ends_with('\n') {
-                    line.push('\n');
-                }
-                if w.write_all(line.as_bytes()).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
+        let conn_state_for_writer = conn_state.clone();
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
+        tokio::spawn(drive_local_writer(
+            write_half,
+            writer_rx,
+            conn_state_for_writer,
+        ));
 
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
@@ -686,7 +707,6 @@ impl RpcClient {
             broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
         let inbound_tx_for_reader = inbound_tx.clone();
 
-        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
         let conn_state_for_reader = conn_state.clone();
 
         let rpc_for_reader = rpc.clone();
@@ -820,10 +840,18 @@ impl RpcClient {
 
         let (mut sink, mut stream) = ws_stream.split();
 
+        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
+        let conn_state_for_writer = conn_state.clone();
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
         tokio::spawn(async move {
             while let Some(line) = writer_rx.recv().await {
-                if sink.send(Message::Text(line.into())).await.is_err() {
+                if let Err(error) = sink.send(Message::Text(line.into())).await {
+                    replace_connection_state(
+                        &conn_state_for_writer,
+                        ConnectionState::Disconnected {
+                            reason: format!("writer: {error}"),
+                        },
+                    );
                     break;
                 }
             }
@@ -836,7 +864,6 @@ impl RpcClient {
             broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
         let inbound_tx_for_reader = inbound_tx.clone();
 
-        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
         let conn_state_for_reader = conn_state.clone();
 
         let rpc_for_reader = rpc.clone();
@@ -1944,6 +1971,40 @@ mod initialize_timeout_tests {
 
         assert!(err.downcast_ref::<DaemonInitializeTimeout>().is_some());
         receiver.abort();
+    }
+}
+
+#[cfg(test)]
+mod writer_failure_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_writer_failure_marks_connection_disconnected() {
+        let (writer, peer) = tokio::io::duplex(64);
+        drop(peer);
+        let connection_state = Arc::new(Mutex::new(ConnectionState::Connected));
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(1);
+        let writer_task = tokio::spawn(drive_local_writer(
+            writer,
+            writer_rx,
+            Arc::clone(&connection_state),
+        ));
+
+        writer_tx
+            .send("{\"jsonrpc\":\"2.0\"}".to_string())
+            .await
+            .expect("writer task should receive the test frame");
+        drop(writer_tx);
+        tokio::time::timeout(Duration::from_secs(1), writer_task)
+            .await
+            .expect("writer task should observe the broken transport")
+            .expect("writer task should not panic");
+
+        let ConnectionState::Disconnected { reason } = clone_connection_state(&connection_state)
+        else {
+            panic!("writer failure must disconnect the client");
+        };
+        assert!(reason.starts_with("writer:"));
     }
 }
 

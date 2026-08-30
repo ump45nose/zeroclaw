@@ -120,6 +120,14 @@ pub(crate) struct Chat {
     /// picker can swap to the populated list without blocking the draw loop.
     model_fetch_tx: mpsc::Sender<ModelFetchResult>,
     model_fetch_rx: mpsc::Receiver<ModelFetchResult>,
+    /// Completion of the background prompt notification enqueue. A failed
+    /// writer-channel send must return active-turn attachment ownership to the
+    /// UI thread so cleanup and user-visible reporting stay serialized.
+    prompt_send_tx: mpsc::Sender<PromptSendResult>,
+    prompt_send_rx: mpsc::Receiver<PromptSendResult>,
+    /// Cleanup failures inherited while this pane is not yet active. Reconnect
+    /// can rebuild into a picker/error phase before the resumed session opens.
+    pending_cleanup_report: CleanupReport,
     phase: ChatPhase,
     pane_kind: PaneKind,
     /// One-shot session id to reattach to on the next session start, set by
@@ -183,6 +191,13 @@ struct GitStatusUpdate {
     hash: Option<String>,
 }
 
+/// Result of handing one prompt notification to the transport writer.
+struct PromptSendResult {
+    session_id: String,
+    turn_generation: u64,
+    sent: bool,
+}
+
 /// Result of a background model-catalog fetch, routed back so the Loading
 /// picker swaps to the populated list (or surfaces an error) on the draw loop.
 struct ModelFetchResult {
@@ -201,6 +216,7 @@ impl Chat {
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
         let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
+        let (prompt_send_tx, prompt_send_rx) = mpsc::channel(4);
         Self {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
@@ -211,6 +227,9 @@ impl Chat {
             git_branch_inflight: false,
             model_fetch_tx,
             model_fetch_rx,
+            prompt_send_tx,
+            prompt_send_rx,
+            pending_cleanup_report: CleanupReport::default(),
             phase: ChatPhase::PickAgent {
                 agents: Vec::new(),
                 list_state: ListState::default(),
@@ -256,6 +275,29 @@ impl Chat {
         match &self.phase {
             ChatPhase::Active(state) => Some(state.agent_alias.as_str()),
             _ => None,
+        }
+    }
+
+    /// Release clipboard temporaries owned by this pane before reconnect
+    /// replacement, returning bounded failures for the new pane to surface.
+    pub(crate) fn cleanup_for_teardown(&mut self) -> CleanupReport {
+        match &mut self.phase {
+            ChatPhase::Active(state) => state.cleanup_for_teardown(),
+            _ => CleanupReport::default(),
+        }
+    }
+
+    /// Surface cleanup failures inherited from a pane replaced on reconnect.
+    pub(crate) fn surface_teardown_cleanup_report(&mut self, report: CleanupReport) {
+        self.pending_cleanup_report.merge(report);
+        self.surface_pending_cleanup_report();
+    }
+
+    /// Apply an inherited cleanup report once the resumed session is active.
+    fn surface_pending_cleanup_report(&mut self) {
+        if let ChatPhase::Active(state) = &mut self.phase {
+            let report = std::mem::take(&mut self.pending_cleanup_report);
+            state.surface_cleanup_report(report);
         }
     }
 
@@ -982,24 +1024,32 @@ impl Chat {
             }
         };
 
-        if let ChatPhase::Active(ref mut state) = self.phase {
+        let turn_generation = if let ChatPhase::Active(ref mut state) = self.phase {
             let att_names: Vec<String> = attachments.iter().map(|a| a.filename.clone()).collect();
             let prompt = if text.is_empty() {
                 None
             } else {
                 Some(text.clone())
             };
-            state.own_active_turn_attachments(attachments);
+            let turn_generation = state.own_active_turn(attachments);
             state.push_user_message(prompt, att_names);
+            turn_generation
         } else {
             let _ = cleanup_attachment_temps(&attachments);
             return;
-        }
-        self.spawn_prompt(sid, text, attachments_json);
+        };
+        self.spawn_prompt(turn_generation, sid, text, attachments_json);
     }
 
-    fn spawn_prompt(&self, sid: String, prompt: String, attachments_json: Vec<serde_json::Value>) {
+    fn spawn_prompt(
+        &self,
+        turn_generation: u64,
+        sid: String,
+        prompt: String,
+        attachments_json: Vec<serde_json::Value>,
+    ) {
         let rpc_arc = self.rpc_out.clone();
+        let result_tx = self.prompt_send_tx.clone();
         tokio::spawn(async move {
             let mut params = serde_json::json!({
                 "session_id": sid,
@@ -1008,8 +1058,41 @@ impl Chat {
             if !attachments_json.is_empty() {
                 params["attachments"] = serde_json::Value::Array(attachments_json);
             }
-            rpc_arc.notify(method::SESSION_PROMPT, params).await;
+            let sent = rpc_arc.notify(method::SESSION_PROMPT, params).await;
+            // Return writer-channel ownership to the UI thread. The active
+            // turn and its temporary files are UI state and must not be
+            // mutated from this background task.
+            let _ = result_tx
+                .send(PromptSendResult {
+                    session_id: sid,
+                    turn_generation,
+                    sent,
+                })
+                .await;
         });
+    }
+
+    /// Apply completed prompt sends on the UI thread.
+    ///
+    /// A closed writer channel means the daemon never accepted the prompt, so
+    /// settle the turn as failed and release its clipboard-owned temporaries.
+    fn drain_prompt_send_results(&mut self) {
+        while let Ok(result) = self.prompt_send_rx.try_recv() {
+            if result.sent {
+                continue;
+            }
+            let ChatPhase::Active(state) = &mut self.phase else {
+                continue;
+            };
+            if state.session_id != result.session_id
+                || state.active_turn_generation != Some(result.turn_generation)
+                || !state.turn_in_flight
+            {
+                continue;
+            }
+
+            state.commit_turn(String::new(), false);
+        }
     }
 
     fn drain_git_branch_results(&mut self) {
@@ -1074,6 +1157,8 @@ impl Chat {
     // ── Drawing ──────────────────────────────────────────────────
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        self.surface_pending_cleanup_report();
+        self.drain_prompt_send_results();
         self.drain_notifications();
         self.drain_inbound_requests();
         self.settle_stuck_cancel();
@@ -5406,6 +5491,11 @@ pub struct ChatState {
     /// submission leaves the composer, this is the sole owner until the turn
     /// reaches a terminal outcome.
     active_turn_attachments: Vec<PendingAttachment>,
+    /// Monotonic generation assigned to the current turn. Background
+    /// prompt-send results must match it before they can settle or clean the
+    /// turn, even if queue ids are reset or reused.
+    active_turn_generation: Option<u64>,
+    next_turn_generation: u64,
     entries: Vec<ChatEntry>,
     streaming_text: String,
     streaming_thought: String,
@@ -5558,6 +5648,8 @@ impl ChatState {
             git_branch_last_fetch: None,
             input_bar: InputBarState::with_shared_commands(commands),
             active_turn_attachments: Vec::new(),
+            active_turn_generation: None,
+            next_turn_generation: 0,
             entries: Vec::new(),
             streaming_text: String::new(),
             streaming_thought: String::new(),
@@ -6739,6 +6831,7 @@ impl ChatState {
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
+        self.active_turn_generation = None;
         let mut cleanup_report = self.cleanup_active_turn_attachments();
         cleanup_report.merge(self.input_bar.take_cleanup_report());
         self.surface_cleanup_report(cleanup_report);
@@ -6781,13 +6874,30 @@ impl ChatState {
         self.turn_started_at = Instant::now();
     }
 
-    fn own_active_turn_attachments(&mut self, attachments: Vec<PendingAttachment>) {
+    fn own_active_turn(&mut self, attachments: Vec<PendingAttachment>) -> u64 {
         debug_assert!(self.active_turn_attachments.is_empty());
+        debug_assert!(self.active_turn_generation.is_none());
+        let generation = self.next_turn_generation;
+        self.next_turn_generation = self.next_turn_generation.wrapping_add(1);
         self.active_turn_attachments = attachments;
+        self.active_turn_generation = Some(generation);
+        generation
     }
 
     fn cleanup_active_turn_attachments(&mut self) -> CleanupReport {
         cleanup_attachment_temps(&std::mem::take(&mut self.active_turn_attachments))
+    }
+
+    /// Release every clipboard temporary owned by this pane during teardown.
+    /// User-selected files remain untouched because each cleanup helper checks
+    /// the attachment source before removing a path.
+    fn cleanup_for_teardown(&mut self) -> CleanupReport {
+        self.input_bar.reset();
+        let mut report = self.input_bar.take_cleanup_report();
+        report.merge(self.cleanup_active_turn_attachments());
+        report.merge(self.clear_queue());
+        self.active_turn_generation = None;
+        report
     }
 
     const QUEUE_CAP: usize = 32;
@@ -7279,6 +7389,7 @@ impl ChatState {
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
+        self.active_turn_generation = None;
         self.browse_cursor = None;
         self.browse_anchor = None;
         self.mouse_down_entry = None;
@@ -7303,6 +7414,14 @@ impl ChatState {
         cleanup_report.merge(self.cleanup_active_turn_attachments());
         cleanup_report.merge(self.clear_queue());
         self.surface_cleanup_report(cleanup_report);
+    }
+}
+
+impl Drop for ChatState {
+    fn drop(&mut self) {
+        // Drop is the final safety net for normal exit, reconnect replacement,
+        // and early-return paths that cannot surface UI feedback anymore.
+        let _ = self.cleanup_for_teardown();
     }
 }
 
@@ -11867,6 +11986,222 @@ mod tests {
         );
         assert!(user_path.exists(), "user-selected file must be preserved");
         assert!(state.active_turn_attachments.is_empty());
+        assert_eq!(state.active_turn_generation, None);
+    }
+
+    #[test]
+    fn dropping_chat_state_cleans_all_owned_clipboard_temps_without_touching_user_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let active_path = dir.path().join("active.png");
+        std::fs::write(&active_path, b"active").expect("write active clipboard temp");
+        let queued_path = dir.path().join("queued.png");
+        std::fs::write(&queued_path, b"queued").expect("write queued clipboard temp");
+        let composer_path = dir.path().join("composer.png");
+        std::fs::write(&composer_path, b"composer").expect("write composer clipboard temp");
+        let user_path = dir.path().join("user.png");
+        std::fs::write(&user_path, b"user").expect("write user file");
+
+        let mut active = state();
+        active.own_active_turn(vec![
+            clipboard_att(&active_path, "active.png"),
+            PendingAttachment {
+                path: user_path.clone(),
+                mime_type: "image/png".to_string(),
+                filename: "user.png".to_string(),
+                size_bytes: 4,
+                source: crate::attachment::AttachmentSource::File,
+            },
+        ]);
+        active
+            .enqueue_message(
+                "queued".to_string(),
+                vec![clipboard_att(&queued_path, "queued.png")],
+            )
+            .expect("queue clipboard attachment");
+        active.input_bar.load_for_edit(
+            String::new(),
+            vec![clipboard_att(&composer_path, "composer.png")],
+        );
+
+        drop(active);
+
+        assert!(
+            !active_path.exists(),
+            "active clipboard temp must be removed"
+        );
+        assert!(
+            !queued_path.exists(),
+            "queued clipboard temp must be removed"
+        );
+        assert!(
+            !composer_path.exists(),
+            "composer clipboard temp must be removed"
+        );
+        assert!(user_path.exists(), "user-selected file must be preserved");
+    }
+
+    #[tokio::test]
+    async fn writer_channel_failure_cleans_active_clipboard_temps_and_reports_failure_count() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let removable_path = dir.path().join("removable.png");
+        std::fs::write(&removable_path, b"clipboard").expect("write clipboard temp");
+        let failed_path = dir.path().join("failed-cleanup");
+        std::fs::create_dir(&failed_path).expect("create forced-failure path");
+        let user_path = dir.path().join("user.png");
+        std::fs::write(&user_path, b"user").expect("write user file");
+
+        let (tx, rx) = mpsc::channel::<String>(16);
+        drop(rx);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            rpc,
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active
+            .enqueue_message(
+                "send attachments".to_string(),
+                vec![
+                    clipboard_att(&removable_path, "removable.png"),
+                    clipboard_att(&failed_path, "failed.png"),
+                    PendingAttachment {
+                        path: user_path.clone(),
+                        mime_type: "image/png".to_string(),
+                        filename: "user.png".to_string(),
+                        size_bytes: 4,
+                        source: crate::attachment::AttachmentSource::File,
+                    },
+                ],
+            )
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.pump_queue();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                chat.drain_prompt_send_results();
+                let settled = matches!(
+                    &chat.phase,
+                    ChatPhase::Active(state) if !state.turn_in_flight
+                );
+                if settled {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed writer send must settle the active turn");
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.active_turn_attachments.is_empty());
+        assert_eq!(state.active_turn_generation, None);
+        assert!(!removable_path.exists(), "clipboard temp must be removed");
+        assert!(failed_path.exists(), "failed cleanup must leave the path");
+        assert!(user_path.exists(), "user-selected file must be preserved");
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("1 temporary file"))
+        );
+        let removable_path = removable_path.to_string_lossy();
+        let failed_path = failed_path.to_string_lossy();
+        assert!(state.entries.iter().all(|entry| match entry {
+            ChatEntry::SystemMessage(text) => {
+                !text.contains(removable_path.as_ref()) && !text.contains(failed_path.as_ref())
+            }
+            _ => true,
+        }));
+    }
+
+    #[tokio::test]
+    async fn stale_prompt_failure_does_not_settle_a_new_turn_in_the_same_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clipboard_path = dir.path().join("new-turn.png");
+        std::fs::write(&clipboard_path, b"clipboard").expect("write clipboard temp");
+
+        let (rpc_tx, _rpc_rx) = mpsc::channel::<String>(16);
+        let client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(rpc_tx))));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        let session_id = active.session_id.clone();
+        active.next_turn_generation = 2;
+        active.own_active_turn(vec![clipboard_att(&clipboard_path, "new-turn.png")]);
+        active.push_user_message(
+            Some("new turn".to_string()),
+            vec!["new-turn.png".to_string()],
+        );
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.prompt_send_tx
+            .send(PromptSendResult {
+                session_id,
+                turn_generation: 1,
+                sent: false,
+            })
+            .await
+            .expect("queue stale prompt result");
+        chat.drain_prompt_send_results();
+
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(
+            state.turn_in_flight,
+            "stale failure must not settle new turn"
+        );
+        assert_eq!(state.active_turn_generation, Some(2));
+        assert!(clipboard_path.exists(), "new turn must retain its temp");
+
+        state.commit_turn(String::new(), false);
+        assert!(!clipboard_path.exists(), "terminal cleanup must still run");
+    }
+
+    #[tokio::test]
+    async fn reconnect_teardown_surfaces_bounded_cleanup_failure_on_rebuilt_pane() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let failed_path = dir.path().join("failed-cleanup");
+        std::fs::create_dir(&failed_path).expect("create forced-failure path");
+
+        let (old_rpc_tx, _old_rpc_rx) = mpsc::channel::<String>(16);
+        let old_client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(old_rpc_tx))));
+        let mut old_chat = Chat::new(old_client, PaneKind::Chat);
+        let mut old_state = state();
+        old_state.own_active_turn(vec![clipboard_att(&failed_path, "failed.png")]);
+        old_chat.phase = ChatPhase::Active(Box::new(old_state));
+
+        let cleanup_report = old_chat.cleanup_for_teardown();
+        assert_eq!(cleanup_report.failed_count(), 1);
+
+        let (new_rpc_tx, _new_rpc_rx) = mpsc::channel::<String>(16);
+        let new_client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(new_rpc_tx))));
+        let mut rebuilt_chat = Chat::new(new_client, PaneKind::Chat);
+        rebuilt_chat.surface_teardown_cleanup_report(cleanup_report);
+        assert_eq!(rebuilt_chat.pending_cleanup_report.failed_count(), 1);
+
+        // Reconnect can briefly rebuild into a non-active phase. The bounded
+        // report must survive until the resumed session becomes active.
+        rebuilt_chat.phase = ChatPhase::Active(Box::new(state()));
+        rebuilt_chat.surface_pending_cleanup_report();
+
+        let ChatPhase::Active(state) = &rebuilt_chat.phase else {
+            panic!("expected active rebuilt chat");
+        };
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("1 temporary file"))
+        );
+        let failed_path = failed_path.to_string_lossy();
+        assert!(state.entries.iter().all(|entry| match entry {
+            ChatEntry::SystemMessage(text) => !text.contains(failed_path.as_ref()),
+            _ => true,
+        }));
     }
 
     #[tokio::test]
