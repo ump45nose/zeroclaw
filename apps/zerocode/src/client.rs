@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
@@ -479,6 +479,84 @@ async fn write_wss_frames<S>(
     }
 }
 
+/// Route local IPC frames until the peer closes or the read half fails.
+async fn read_local_frames<R>(
+    read_half: R,
+    state: Arc<Mutex<ConnectionState>>,
+    rpc: Arc<RpcOutbound>,
+    notif_tx: broadcast::Sender<RpcNotification>,
+    inbound_tx: broadcast::Sender<RpcInboundRequest>,
+) where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(read_half);
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf).await {
+            Ok(0) => {
+                record_disconnect(&state, &rpc, "EOF (daemon closed connection)");
+                break;
+            }
+            Err(error) => {
+                record_disconnect(&state, &rpc, error.to_string());
+                break;
+            }
+            Ok(_) => {}
+        }
+        let frame: Value = match serde_json::from_str(buf.trim()) {
+            Ok(frame) => frame,
+            Err(_) => continue,
+        };
+        route_inbound_frame(&rpc, &notif_tx, &inbound_tx, frame);
+    }
+}
+
+/// Route WSS frames until the peer closes or the read half fails.
+async fn read_wss_frames<S, E>(
+    mut stream: S,
+    state: Arc<Mutex<ConnectionState>>,
+    rpc: Arc<RpcOutbound>,
+    notif_tx: broadcast::Sender<RpcNotification>,
+    inbound_tx: broadcast::Sender<RpcInboundRequest>,
+) where
+    S: futures_util::Stream<Item = std::result::Result<tokio_tungstenite::tungstenite::Message, E>>
+        + Unpin,
+    E: fmt::Display,
+{
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let frame: Value = match serde_json::from_str(&text) {
+                    Ok(frame) => frame,
+                    Err(_) => continue,
+                };
+                route_inbound_frame(&rpc, &notif_tx, &inbound_tx, frame);
+            }
+            Some(Ok(Message::Close(frame))) => {
+                let reason = frame
+                    .map(|frame| frame.reason.to_string())
+                    .unwrap_or_else(|| "server closed connection".to_string());
+                record_disconnect(&state, &rpc, reason);
+                break;
+            }
+            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
+            Some(Ok(Message::Binary(_))) => continue,
+            Some(Err(error)) => {
+                record_disconnect(&state, &rpc, error.to_string());
+                break;
+            }
+            None => {
+                record_disconnect(&state, &rpc, "EOF (WSS connection closed)");
+                break;
+            }
+        }
+    }
+}
+
 /// The TUI and daemon are built from the same package version and do not
 /// promise cross-version wire compatibility.
 #[derive(Debug)]
@@ -683,12 +761,12 @@ fn route_inbound_frame(
     }
 }
 
-/// Aborts a detached transport writer when its owning RPC client is dropped.
+/// Aborts a spawned client task when its owning RPC client is dropped.
 #[derive(Debug)]
 struct AbortTaskOnDrop(tokio::task::AbortHandle);
 
 impl AbortTaskOnDrop {
-    /// Bind the lifetime of a spawned writer task to its owning client.
+    /// Bind the lifetime of a spawned task to its owning client.
     fn new(handle: tokio::task::AbortHandle) -> Self {
         Self(handle)
     }
@@ -696,8 +774,8 @@ impl AbortTaskOnDrop {
 
 impl Drop for AbortTaskOnDrop {
     fn drop(&mut self) {
-        // Reconnect replaces the old client after reader-side EOF/Close; aborting
-        // here releases the old receiver, socket/TLS write half, and RpcOutbound.
+        // Reconnect replaces the whole client; aborting every owned task releases
+        // both transport halves and prevents the notification router from detaching.
         self.0.abort();
     }
 }
@@ -705,9 +783,9 @@ impl Drop for AbortTaskOnDrop {
 #[derive(Debug)]
 pub struct RpcClient {
     pub(crate) rpc: Arc<RpcOutbound>,
-    _read_task: tokio::task::JoinHandle<()>,
+    _read_task: AbortTaskOnDrop,
     _writer_task: AbortTaskOnDrop,
-    _router_task: tokio::task::JoinHandle<()>,
+    _router_task: AbortTaskOnDrop,
     pub server_version: String,
     /// OS process ID reported by the daemon during initialize.
     pub server_pid: Option<u32>,
@@ -761,41 +839,13 @@ impl RpcClient {
             broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
         let inbound_tx_for_reader = inbound_tx.clone();
 
-        let conn_state_for_reader = conn_state.clone();
-
-        let rpc_for_reader = rpc.clone();
-        let read_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(read_half);
-            let mut buf = String::new();
-            loop {
-                buf.clear();
-                match reader.read_line(&mut buf).await {
-                    Ok(0) => {
-                        record_disconnect(
-                            &conn_state_for_reader,
-                            &rpc_for_reader,
-                            "EOF (daemon closed connection)",
-                        );
-                        break;
-                    }
-                    Err(e) => {
-                        record_disconnect(&conn_state_for_reader, &rpc_for_reader, e.to_string());
-                        break;
-                    }
-                    Ok(_) => {}
-                }
-                let frame: Value = match serde_json::from_str(buf.trim()) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                route_inbound_frame(
-                    &rpc_for_reader,
-                    &notif_tx_for_reader,
-                    &inbound_tx_for_reader,
-                    frame,
-                );
-            }
-        });
+        let read_task = tokio::spawn(read_local_frames(
+            read_half,
+            Arc::clone(&conn_state),
+            Arc::clone(&rpc),
+            notif_tx_for_reader,
+            inbound_tx_for_reader,
+        ));
 
         let mut init_params = serde_json::json!({
             "protocol_version": jsonrpc::ACP_PROTOCOL_VERSION,
@@ -843,9 +893,9 @@ impl RpcClient {
 
         Ok(Self {
             rpc,
-            _read_task: read_task,
+            _read_task: AbortTaskOnDrop::new(read_task.abort_handle()),
             _writer_task: writer_task,
-            _router_task: router_task,
+            _router_task: AbortTaskOnDrop::new(router_task.abort_handle()),
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
@@ -872,7 +922,6 @@ impl RpcClient {
         tls_skip_verify: bool,
     ) -> Result<Self> {
         use futures_util::StreamExt;
-        use tokio_tungstenite::tungstenite::Message;
 
         let connector = if tls_skip_verify {
             Some(tokio_tungstenite::Connector::Rustls(
@@ -887,7 +936,7 @@ impl RpcClient {
                 .await
                 .with_context(|| format!("WSS connect to {url}"))?;
 
-        let (sink, mut stream) = ws_stream.split();
+        let (sink, stream) = ws_stream.split();
 
         let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
         let rpc = Arc::new(jsonrpc::RpcOutbound::new(writer_tx));
@@ -905,48 +954,13 @@ impl RpcClient {
             broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
         let inbound_tx_for_reader = inbound_tx.clone();
 
-        let conn_state_for_reader = conn_state.clone();
-
-        let rpc_for_reader = rpc.clone();
-        let read_task = tokio::spawn(async move {
-            loop {
-                match stream.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let frame: Value = match serde_json::from_str(&text) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        route_inbound_frame(
-                            &rpc_for_reader,
-                            &notif_tx_for_reader,
-                            &inbound_tx_for_reader,
-                            frame,
-                        );
-                    }
-                    Some(Ok(Message::Close(frame))) => {
-                        let reason = frame
-                            .map(|f| f.reason.to_string())
-                            .unwrap_or_else(|| "server closed connection".to_string());
-                        record_disconnect(&conn_state_for_reader, &rpc_for_reader, reason);
-                        break;
-                    }
-                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
-                    Some(Ok(Message::Binary(_))) => continue,
-                    Some(Err(e)) => {
-                        record_disconnect(&conn_state_for_reader, &rpc_for_reader, e.to_string());
-                        break;
-                    }
-                    None => {
-                        record_disconnect(
-                            &conn_state_for_reader,
-                            &rpc_for_reader,
-                            "EOF (WSS connection closed)",
-                        );
-                        break;
-                    }
-                }
-            }
-        });
+        let read_task = tokio::spawn(read_wss_frames(
+            stream,
+            Arc::clone(&conn_state),
+            Arc::clone(&rpc),
+            notif_tx_for_reader,
+            inbound_tx_for_reader,
+        ));
 
         // Initialize handshake — identical to Unix socket path.
         let mut init_params = serde_json::json!({
@@ -991,9 +1005,9 @@ impl RpcClient {
 
         Ok(Self {
             rpc,
-            _read_task: read_task,
+            _read_task: AbortTaskOnDrop::new(read_task.abort_handle()),
             _writer_task: writer_task,
-            _router_task: router_task,
+            _router_task: AbortTaskOnDrop::new(router_task.abort_handle()),
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
@@ -1852,12 +1866,14 @@ impl RpcClient {
     pub fn with_rpc(outbound: Arc<RpcOutbound>) -> Self {
         let (notif_tx, _) = tokio::sync::broadcast::channel(1);
         let (inbound_tx, _) = tokio::sync::broadcast::channel(1);
+        let read_task = tokio::spawn(async {});
         let writer_task = tokio::spawn(async {});
+        let router_task = tokio::spawn(async {});
         Self {
             rpc: outbound,
-            _read_task: tokio::spawn(async {}),
+            _read_task: AbortTaskOnDrop::new(read_task.abort_handle()),
             _writer_task: AbortTaskOnDrop::new(writer_task.abort_handle()),
-            _router_task: tokio::spawn(async {}),
+            _router_task: AbortTaskOnDrop::new(router_task.abort_handle()),
             server_version: "test".to_string(),
             server_pid: None,
             notifications_bcast: notif_tx,
@@ -2005,9 +2021,13 @@ mod initialize_timeout_tests {
 #[cfg(test)]
 mod writer_disconnect_tests {
     use super::*;
+    use futures_util::StreamExt;
     use std::io;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
+    use tokio_tungstenite::tungstenite::protocol::Role;
 
     struct FailingWriter;
 
@@ -2030,6 +2050,115 @@ mod writer_disconnect_tests {
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    /// Transport whose writer fails while its reader remains pending until cancellation.
+    struct WriterFailsReaderPending {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for WriterFailsReaderPending {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl AsyncRead for WriterFailsReaderPending {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            // The peer keeps its write half open, so the client reader must stay parked.
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for WriterFailsReaderPending {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "test transport writer closed",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Assert writer-first failure cannot leave a detached reader, transport, or router.
+    async fn assert_writer_first_drop_releases_client_tasks(
+        transport: Transport,
+        rpc: Arc<RpcOutbound>,
+        state: Arc<Mutex<ConnectionState>>,
+        read_task: tokio::task::JoinHandle<()>,
+        writer_task: tokio::task::JoinHandle<()>,
+        router_task: tokio::task::JoinHandle<()>,
+        notif_tx: broadcast::Sender<RpcNotification>,
+        mut update_rx: mpsc::Receiver<SessionUpdate>,
+        transport_dropped: Arc<AtomicBool>,
+    ) {
+        let mut client = RpcClient::with_rpc(Arc::clone(&rpc));
+        client.transport = transport;
+        client.connection_state = Arc::clone(&state);
+        client.notifications_bcast = notif_tx.clone();
+        client._read_task = AbortTaskOnDrop::new(read_task.abort_handle());
+        client._writer_task = AbortTaskOnDrop::new(writer_task.abort_handle());
+        client._router_task = AbortTaskOnDrop::new(router_task.abort_handle());
+
+        // Make the writer fail first while the transport reader and router stay live.
+        rpc.notify("test/frame", serde_json::json!({})).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    &*state.lock().unwrap_or_else(|error| error.into_inner()),
+                    ConnectionState::Disconnected { .. }
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer failure should mark the transport disconnected");
+        writer_task
+            .await
+            .expect("writer task should finish after its forced failure");
+
+        assert!(!read_task.is_finished());
+        assert!(!router_task.is_finished());
+        assert!(!transport_dropped.load(Ordering::SeqCst));
+        assert_eq!(notif_tx.receiver_count(), 1);
+
+        drop(client);
+
+        let read_error = tokio::time::timeout(Duration::from_secs(1), read_task)
+            .await
+            .expect("reader task should stop when its client is dropped")
+            .expect_err("pending reader task should be aborted");
+        assert!(read_error.is_cancelled());
+        let router_error = tokio::time::timeout(Duration::from_secs(1), router_task)
+            .await
+            .expect("router task should stop when its client is dropped")
+            .expect_err("pending router task should be aborted");
+        assert!(router_error.is_cancelled());
+        assert!(transport_dropped.load(Ordering::SeqCst));
+        assert_eq!(notif_tx.receiver_count(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), update_rx.recv())
+                .await
+                .expect("router output should close when its client is dropped")
+                .is_none()
+        );
     }
 
     /// Assert reader-first disconnect cleanup aborts the writer owned by a replaced client.
@@ -2142,6 +2271,95 @@ mod writer_disconnect_tests {
             writer_probe,
             rpc,
             state,
+        )
+        .await;
+    }
+
+    /// Covers local writer-first failure while the peer keeps the read side open.
+    #[tokio::test]
+    async fn local_writer_failure_then_client_drop_releases_reader_and_router() {
+        let transport_dropped = Arc::new(AtomicBool::new(false));
+        let transport = WriterFailsReaderPending {
+            dropped: Arc::clone(&transport_dropped),
+        };
+        let (read_half, write_half) = tokio::io::split(transport);
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(1);
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let state = Arc::new(Mutex::new(ConnectionState::Connected));
+        let (notif_tx, _) = broadcast::channel::<RpcNotification>(1);
+        let (inbound_tx, _) = broadcast::channel::<RpcInboundRequest>(1);
+        let (update_tx, update_rx) = mpsc::channel::<SessionUpdate>(1);
+        let read_task = tokio::spawn(read_local_frames(
+            read_half,
+            Arc::clone(&state),
+            Arc::clone(&rpc),
+            notif_tx.clone(),
+            inbound_tx,
+        ));
+        let writer_task = tokio::spawn(write_local_frames(
+            write_half,
+            writer_rx,
+            Arc::clone(&state),
+            Arc::clone(&rpc),
+        ));
+        let router_task = spawn_notification_router(notif_tx.subscribe(), update_tx);
+
+        assert_writer_first_drop_releases_client_tasks(
+            Transport::Local,
+            rpc,
+            state,
+            read_task,
+            writer_task,
+            router_task,
+            notif_tx,
+            update_rx,
+            transport_dropped,
+        )
+        .await;
+    }
+
+    /// Covers WSS writer-first failure while the peer keeps the read side open.
+    #[tokio::test]
+    async fn wss_writer_failure_then_client_drop_releases_reader_and_router() {
+        let transport_dropped = Arc::new(AtomicBool::new(false));
+        let transport = WriterFailsReaderPending {
+            dropped: Arc::clone(&transport_dropped),
+        };
+        let websocket =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(transport, Role::Client, None)
+                .await;
+        let (sink, stream) = websocket.split();
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(1);
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let state = Arc::new(Mutex::new(ConnectionState::Connected));
+        let (notif_tx, _) = broadcast::channel::<RpcNotification>(1);
+        let (inbound_tx, _) = broadcast::channel::<RpcInboundRequest>(1);
+        let (update_tx, update_rx) = mpsc::channel::<SessionUpdate>(1);
+        let read_task = tokio::spawn(read_wss_frames(
+            stream,
+            Arc::clone(&state),
+            Arc::clone(&rpc),
+            notif_tx.clone(),
+            inbound_tx,
+        ));
+        let writer_task = tokio::spawn(write_wss_frames(
+            sink,
+            writer_rx,
+            Arc::clone(&state),
+            Arc::clone(&rpc),
+        ));
+        let router_task = spawn_notification_router(notif_tx.subscribe(), update_tx);
+
+        assert_writer_first_drop_releases_client_tasks(
+            Transport::Wss,
+            rpc,
+            state,
+            read_task,
+            writer_task,
+            router_task,
+            notif_tx,
+            update_rx,
+            transport_dropped,
         )
         .await;
     }
