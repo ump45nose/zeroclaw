@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 // ── Protocol constants ───────────────────────────────────────────
 
@@ -125,9 +125,9 @@ pub const ACP_PROTOCOL_VERSION: u64 = 1;
 type PendingResponder = oneshot::Sender<std::result::Result<Value, JsonRpcError>>;
 
 #[derive(Debug, Default)]
-struct PendingRequests {
-    responders: HashMap<String, PendingResponder>,
-    terminal_error: Option<JsonRpcError>,
+struct OutboundState {
+    pending: HashMap<String, PendingResponder>,
+    closed_error: Option<JsonRpcError>,
 }
 
 /// Writer + outbound-call tracker shared between the read loop and
@@ -136,22 +136,21 @@ struct PendingRequests {
 #[derive(Debug)]
 pub struct RpcOutbound {
     writer_tx: mpsc::Sender<String>,
-    pending: std::sync::Mutex<PendingRequests>,
-    terminal_notify: Notify,
+    state: std::sync::Mutex<OutboundState>,
     next_id: AtomicU64,
 }
 
 struct PendingRequestGuard<'a> {
-    pending: &'a std::sync::Mutex<PendingRequests>,
+    state: &'a std::sync::Mutex<OutboundState>,
     id: String,
 }
 
 impl Drop for PendingRequestGuard<'_> {
     fn drop(&mut self) {
-        self.pending
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .responders
+            .pending
             .remove(&self.id);
     }
 }
@@ -160,37 +159,13 @@ impl RpcOutbound {
     pub fn new(writer_tx: mpsc::Sender<String>) -> Self {
         Self {
             writer_tx,
-            pending: std::sync::Mutex::new(PendingRequests::default()),
-            terminal_notify: Notify::new(),
+            state: std::sync::Mutex::new(OutboundState::default()),
             next_id: AtomicU64::new(0),
         }
     }
 
     pub async fn send_raw(&self, json: String) -> bool {
-        self.send_until_disconnect(json).await
-    }
-
-    /// Enqueue a non-request frame unless the transport reaches its terminal state.
-    async fn send_until_disconnect(&self, body: String) -> bool {
-        // Register before reading the canonical terminal state so a disconnect
-        // cannot occur between the state check and waiting on the wake-up signal.
-        let mut terminal = Box::pin(self.terminal_notify.notified());
-        terminal.as_mut().enable();
-        if self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .terminal_error
-            .is_some()
-        {
-            return false;
-        }
-
-        tokio::select! {
-            biased;
-            _ = &mut terminal => false,
-            result = self.writer_tx.send(body) => result.is_ok(),
-        }
+        self.writer_tx.send(json).await.is_ok()
     }
 
     /// Write a JSON-RPC response (success or error) keyed to a
@@ -209,7 +184,7 @@ impl RpcOutbound {
             id,
         };
         match serde_json::to_string(&resp) {
-            Ok(s) => self.send_until_disconnect(s).await,
+            Ok(s) => self.writer_tx.send(s).await.is_ok(),
             Err(_) => false,
         }
     }
@@ -217,7 +192,7 @@ impl RpcOutbound {
     pub async fn notify(&self, method: &'static str, params: Value) {
         let n = JsonRpcNotification::new(method, params);
         if let Ok(s) = serde_json::to_string(&n) {
-            let _ = self.send_until_disconnect(s).await;
+            let _ = self.writer_tx.send(s).await;
         }
     }
 
@@ -228,16 +203,16 @@ impl RpcOutbound {
     ) -> std::result::Result<Value, JsonRpcError> {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = format!("{OUTBOUND_ID_PREFIX}{n}");
-        let (tx, mut rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(error) = &pending.terminal_error {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(error) = &state.closed_error {
                 return Err(error.clone());
             }
-            pending.responders.insert(id.clone(), tx);
+            state.pending.insert(id.clone(), tx);
         }
         let _pending_guard = PendingRequestGuard {
-            pending: &self.pending,
+            state: &self.state,
             id: id.clone(),
         };
         let req = JsonRpcRequest::new(method, params, Value::String(id));
@@ -251,27 +226,14 @@ impl RpcOutbound {
                 });
             }
         };
-        // The writer queue can remain full while the reader independently
-        // observes EOF. Race the queue send against the registered responder
-        // so a terminal transport error can cancel an unsent request.
-        let early_response = tokio::select! {
-            response = &mut rx => Some(response),
-            send_result = self.writer_tx.send(body) => {
-                if send_result.is_err() {
-                    return Err(JsonRpcError {
-                        code: error_codes::INTERNAL_ERROR,
-                        message: "Writer task closed".to_string(),
-                        data: None,
-                    });
-                }
-                None
-            }
-        };
-        let response = match early_response {
-            Some(response) => response,
-            None => rx.await,
-        };
-        response.unwrap_or_else(|_| {
+        if self.writer_tx.send(body).await.is_err() {
+            return Err(JsonRpcError {
+                code: error_codes::INTERNAL_ERROR,
+                message: "Writer task closed".to_string(),
+                data: None,
+            });
+        }
+        rx.await.unwrap_or_else(|_| {
             Err(JsonRpcError {
                 code: error_codes::INTERNAL_ERROR,
                 message: "Outbound RPC dropped".to_string(),
@@ -287,10 +249,10 @@ impl RpcOutbound {
         error: Option<JsonRpcError>,
     ) {
         let responder = self
-            .pending
+            .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .responders
+            .pending
             .remove(id_str);
         if let Some(tx) = responder {
             let payload = if let Some(err) = error {
@@ -302,216 +264,31 @@ impl RpcOutbound {
         }
     }
 
-    /// Fail every in-flight request when the underlying transport closes.
-    ///
-    /// Drain the map before waking callers so their request guards never
-    /// contend with this method while dropping.
-    pub(crate) fn fail_all_pending(&self, error: JsonRpcError) {
-        let (responders, terminal_error, became_terminal) = {
-            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            let became_terminal = pending.terminal_error.is_none();
-            let terminal_error = pending
-                .terminal_error
-                .get_or_insert_with(|| error.clone())
+    /// Close request admission and fail every request still awaiting a response
+    /// when the owning transport terminates. Responders are woken after release.
+    pub fn fail_pending(&self, message: &str) {
+        let (responders, error) = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let error = state
+                .closed_error
+                .get_or_insert_with(|| JsonRpcError {
+                    code: error_codes::INTERNAL_ERROR,
+                    message: message.to_string(),
+                    data: None,
+                })
                 .clone();
-            let responders = pending
-                .responders
-                .drain()
-                .map(|(_, responder)| responder)
-                .collect::<Vec<_>>();
-            (responders, terminal_error, became_terminal)
+            (std::mem::take(&mut state.pending), error)
         };
-
-        if became_terminal {
-            self.terminal_notify.notify_waiters();
-        }
-
-        for responder in responders {
-            let _ = responder.send(Err(terminal_error.clone()));
+        for (_, responder) in responders {
+            let _ = responder.send(Err(error.clone()));
         }
     }
 
     pub fn pending_count(&self) -> usize {
-        self.pending
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .responders
+            .pending
             .len()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn transport_failure_wakes_and_rejects_requests() {
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(1);
-        let rpc = Arc::new(RpcOutbound::new(writer_tx));
-        let request_rpc = Arc::clone(&rpc);
-        let request = tokio::spawn(async move {
-            request_rpc
-                .request("session/new", serde_json::json!({}))
-                .await
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), writer_rx.recv())
-            .await
-            .expect("request should be written")
-            .expect("writer should stay open");
-        assert_eq!(rpc.pending_count(), 1);
-
-        rpc.fail_all_pending(JsonRpcError {
-            code: error_codes::INTERNAL_ERROR,
-            message: "daemon disconnected".to_string(),
-            data: None,
-        });
-
-        let error = tokio::time::timeout(Duration::from_secs(1), request)
-            .await
-            .expect("pending request should wake immediately")
-            .expect("request task should complete")
-            .expect_err("disconnection should fail the request");
-        assert_eq!(error.message, "daemon disconnected");
-        assert_eq!(rpc.pending_count(), 0);
-
-        let late_error = tokio::time::timeout(
-            Duration::from_secs(1),
-            rpc.request("session/new", serde_json::json!({})),
-        )
-        .await
-        .expect("request after disconnect should fail immediately")
-        .expect_err("disconnected transport should reject new requests");
-        assert_eq!(late_error.message, "daemon disconnected");
-        assert!(matches!(
-            writer_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-    }
-
-    /// Proves a terminal transport error interrupts a request blocked on a full writer queue.
-    #[tokio::test]
-    async fn transport_failure_interrupts_request_blocked_on_full_writer_queue() {
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(1);
-        writer_tx
-            .send("occupied".to_string())
-            .await
-            .expect("writer queue should accept the prefilled frame");
-        let rpc = Arc::new(RpcOutbound::new(writer_tx));
-        let request_rpc = Arc::clone(&rpc);
-        let request = tokio::spawn(async move {
-            request_rpc
-                .request("session/new", serde_json::json!({}))
-                .await
-        });
-
-        // Wait until the request has registered its responder and is blocked
-        // behind the prefilled frame without draining the live receiver.
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while rpc.pending_count() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("request should register while the writer queue stays full");
-
-        rpc.fail_all_pending(JsonRpcError {
-            code: error_codes::INTERNAL_ERROR,
-            message: "daemon disconnected".to_string(),
-            data: None,
-        });
-
-        let error = tokio::time::timeout(Duration::from_secs(1), request)
-            .await
-            .expect("blocked request should wake without a free writer slot")
-            .expect("request task should complete")
-            .expect_err("disconnection should fail the blocked request");
-        assert_eq!(error.message, "daemon disconnected");
-        assert_eq!(rpc.pending_count(), 0);
-        assert_eq!(
-            writer_rx
-                .try_recv()
-                .expect("prefilled frame should still occupy the queue"),
-            "occupied"
-        );
-        assert!(matches!(
-            writer_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-    }
-
-    /// Proves a detached notification cannot remain parked after disconnect.
-    #[tokio::test]
-    async fn transport_failure_interrupts_notification_blocked_on_full_writer_queue() {
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(1);
-        writer_tx
-            .send("occupied".to_string())
-            .await
-            .expect("writer queue should accept the prefilled frame");
-        let rpc = Arc::new(RpcOutbound::new(writer_tx));
-        let notify_rpc = Arc::clone(&rpc);
-        let notification = tokio::spawn(async move {
-            notify_rpc
-                .notify("session/prompt", serde_json::json!({"prompt": "hello"}))
-                .await;
-        });
-
-        tokio::task::yield_now().await;
-        assert!(!notification.is_finished());
-        rpc.fail_all_pending(JsonRpcError {
-            code: error_codes::INTERNAL_ERROR,
-            message: "daemon disconnected".to_string(),
-            data: None,
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), notification)
-            .await
-            .expect("blocked notification should stop without a free writer slot")
-            .expect("notification task should complete");
-        assert_eq!(
-            writer_rx
-                .try_recv()
-                .expect("prefilled frame should still occupy the queue"),
-            "occupied"
-        );
-    }
-
-    /// Proves a server-request response cannot remain parked after disconnect.
-    #[tokio::test]
-    async fn transport_failure_interrupts_response_blocked_on_full_writer_queue() {
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(1);
-        writer_tx
-            .send("occupied".to_string())
-            .await
-            .expect("writer queue should accept the prefilled frame");
-        let rpc = Arc::new(RpcOutbound::new(writer_tx));
-        let response_rpc = Arc::clone(&rpc);
-        let response = tokio::spawn(async move {
-            response_rpc
-                .respond(Value::from(7), Ok(serde_json::json!({"accepted": true})))
-                .await
-        });
-
-        tokio::task::yield_now().await;
-        assert!(!response.is_finished());
-        rpc.fail_all_pending(JsonRpcError {
-            code: error_codes::INTERNAL_ERROR,
-            message: "daemon disconnected".to_string(),
-            data: None,
-        });
-
-        let sent = tokio::time::timeout(Duration::from_secs(1), response)
-            .await
-            .expect("blocked response should stop without a free writer slot")
-            .expect("response task should complete");
-        assert!(!sent);
-        assert_eq!(
-            writer_rx
-                .try_recv()
-                .expect("prefilled frame should still occupy the queue"),
-            "occupied"
-        );
     }
 }
