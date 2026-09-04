@@ -12466,8 +12466,14 @@ mod tests {
 
         drop(active);
 
-        assert!(!active_path.exists(), "active clipboard temp must be removed");
-        assert!(!queued_path.exists(), "queued clipboard temp must be removed");
+        assert!(
+            !active_path.exists(),
+            "active clipboard temp must be removed"
+        );
+        assert!(
+            !queued_path.exists(),
+            "queued clipboard temp must be removed"
+        );
         assert!(
             !composer_path.exists(),
             "composer clipboard temp must be removed"
@@ -12505,9 +12511,12 @@ mod tests {
         let ChatPhase::Active(state) = &rebuilt_chat.phase else {
             panic!("expected active rebuilt chat");
         };
-        assert!(state.info_message.as_ref().is_some_and(|message| {
-            message.text.contains("1 temporary file")
-        }));
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|message| { message.text.contains("1 temporary file") })
+        );
         let failed_path = failed_path.to_string_lossy();
         assert!(state.entries.iter().all(|entry| match entry {
             ChatEntry::SystemMessage(text) => !text.contains(failed_path.as_ref()),
