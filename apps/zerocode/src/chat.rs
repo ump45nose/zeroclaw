@@ -13017,7 +13017,7 @@ mod tests {
             }
         }
 
-        let chat = tokio::time::timeout(Duration::from_secs(2), init)
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), init)
             .await
             .expect("a healthy background should keep the pane usable")
             .unwrap();
@@ -19801,9 +19801,12 @@ mod tests {
             entry.cleanup_notice,
         );
 
-        assert!(rebuilt.info_message.as_ref().is_some_and(|message| {
-            message.text.contains("1 temporary file")
-        }));
+        assert!(
+            rebuilt
+                .info_message
+                .as_ref()
+                .is_some_and(|message| { message.text.contains("1 temporary file") })
+        );
     }
 
     #[test]
