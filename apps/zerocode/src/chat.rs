@@ -19738,8 +19738,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn normal_exit_cleans_active_clipboard_attachment_without_touching_user_file() {
+    #[tokio::test]
+    async fn normal_exit_cleans_active_clipboard_attachment_without_touching_user_file() {
         let dir = tempfile::tempdir().expect("temp dir");
         let clipboard_path = dir.path().join("normal-exit-clipboard.png");
         let user_path = dir.path().join("normal-exit-user.png");
@@ -19774,8 +19774,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reconnect_adoption_restores_active_turn_cleanup_failure_notice() {
+    #[tokio::test]
+    async fn reconnect_adoption_restores_active_turn_cleanup_failure_notice() {
         let dir = tempfile::tempdir().expect("temp dir");
         let blocked_path = dir.path().join("cleanup-failure");
         std::fs::create_dir(&blocked_path).expect("create forced-failure path");
