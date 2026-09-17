@@ -1,5 +1,5 @@
 //! Shell-level agent sidebar: every session the chat-like panes track, with
-//! live status dots, a `+` picker to add an agent, and the Quickstart
+//! live status dots, `+`/`-` session controls, and the Quickstart
 //! launcher at the bottom.
 //!
 //! The sidebar owns only widget state (visibility, width, scroll, hit rects,
@@ -43,6 +43,7 @@ pub(crate) struct SidebarCtx {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SidebarEvent {
     FocusSession { pane: PaneKind, session_id: String },
+    CloseSession { pane: PaneKind, session_id: String },
     OpenPicker,
     PickAgent { pane: PaneKind, alias: String },
     OpenQuickstart,
@@ -93,6 +94,9 @@ pub(crate) struct AgentSidebar {
     // Geometry recorded by draw, read by the mouse handler (repo convention:
     // draw records, mouse reads). All `Rect::default()` while hidden.
     area: Rect,
+    minus_rect: Rect,
+    /// The focused session in the active pane, captured during the last draw.
+    minus_target: Option<(PaneKind, String)>,
     plus_rect: Rect,
     quickstart_rect: Rect,
     row_rects: Vec<(PaneKind, String, Rect)>,
@@ -109,6 +113,8 @@ impl AgentSidebar {
             width: section.width,
             scroll: 0,
             area: Rect::default(),
+            minus_rect: Rect::default(),
+            minus_target: None,
             plus_rect: Rect::default(),
             quickstart_rect: Rect::default(),
             row_rects: Vec::new(),
@@ -141,6 +147,8 @@ impl AgentSidebar {
     /// at [`CONTENT_MIN_COLS`].
     pub(crate) fn carve(&mut self, content: Rect) -> (Option<Rect>, Rect) {
         self.area = Rect::default();
+        self.minus_rect = Rect::default();
+        self.minus_target = None;
         self.plus_rect = Rect::default();
         self.quickstart_rect = Rect::default();
         self.row_rects.clear();
@@ -175,8 +183,28 @@ impl AgentSidebar {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // The `+` affordance lives on the top border, right-aligned. It dims
-        // while disconnected (the shell gates the actions anyway).
+        // The session controls live on the top border. `-` targets only the
+        // visibly focused session in the active pane; the shell still gates
+        // both actions while disconnected.
+        self.minus_target = rows
+            .iter()
+            .find(|summary| summary.focused && ctx.active_pane == Some(summary.pane_kind))
+            .map(|summary| (summary.pane_kind, summary.session_id.clone()));
+        if area.width >= 10 {
+            let minus = Rect {
+                x: area.x + area.width - 8,
+                y: area.y,
+                width: 3,
+                height: 1,
+            };
+            let minus_style = if ctx.connected && self.minus_target.is_some() {
+                theme::accent_style()
+            } else {
+                theme::dim_style()
+            };
+            frame.render_widget(Paragraph::new(Span::styled("[-]", minus_style)), minus);
+            self.minus_rect = minus;
+        }
         if area.width >= 6 {
             let plus = Rect {
                 x: area.x + area.width - 4,
@@ -492,6 +520,11 @@ impl AgentSidebar {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let (col, row) = (mouse.column, mouse.row);
+                if mouse::in_rect(col, row, self.minus_rect)
+                    && let Some((pane, session_id)) = self.minus_target.clone()
+                {
+                    return Some(SidebarEvent::CloseSession { pane, session_id });
+                }
                 if mouse::in_rect(col, row, self.plus_rect) {
                     return Some(SidebarEvent::OpenPicker);
                 }
@@ -580,6 +613,8 @@ mod tests {
             width: 24,
             scroll: 0,
             area: Rect::default(),
+            minus_rect: Rect::default(),
+            minus_target: None,
             plus_rect: Rect::default(),
             quickstart_rect: Rect::default(),
             row_rects: Vec::new(),
@@ -650,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_records_row_plus_and_quickstart_rects() {
+    fn draw_records_row_controls_and_quickstart_rects() {
         let mut s = sidebar();
         let area = s.carve(Rect::new(0, 1, 100, 12)).0.unwrap();
         let rows = vec![summary("alpha", "s1", true), summary("beta", "s2", false)];
@@ -664,6 +699,7 @@ mod tests {
         term.draw(|frame| s.draw(frame, area, &rows, &ctx)).unwrap();
 
         assert_eq!(s.row_rects.len(), 2);
+        assert!(s.minus_rect.width > 0, "minus affordance recorded");
         assert!(s.plus_rect.width > 0, "plus affordance recorded");
         assert!(s.quickstart_rect.width > 0, "quickstart row recorded");
 
@@ -690,12 +726,44 @@ mod tests {
             );
         }
         assert_eq!(
+            s.handle_mouse(&click(s.minus_rect.x, s.minus_rect.y)),
+            Some(SidebarEvent::CloseSession {
+                pane: PaneKind::Chat,
+                session_id: "s1".into(),
+            })
+        );
+        assert_eq!(
             s.handle_mouse(&click(s.plus_rect.x, s.plus_rect.y)),
             Some(SidebarEvent::OpenPicker)
         );
         assert_eq!(
             s.handle_mouse(&click(s.quickstart_rect.x, s.quickstart_rect.y)),
             Some(SidebarEvent::OpenQuickstart)
+        );
+    }
+
+    #[test]
+    fn minus_targets_the_focused_session_in_the_active_pane() {
+        let mut sidebar = sidebar();
+        let area = sidebar.carve(Rect::new(0, 0, 100, 10)).0.unwrap();
+        let chat = summary("chat-agent", "chat-session", true);
+        let mut code = summary("code-agent", "code-session", true);
+        code.pane_kind = PaneKind::Acp;
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Acp),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
+        term.draw(|frame| sidebar.draw(frame, area, &[chat, code], &ctx))
+            .unwrap();
+
+        assert_eq!(
+            sidebar.handle_mouse(&click(sidebar.minus_rect.x, sidebar.minus_rect.y)),
+            Some(SidebarEvent::CloseSession {
+                pane: PaneKind::Acp,
+                session_id: "code-session".into(),
+            })
         );
     }
 

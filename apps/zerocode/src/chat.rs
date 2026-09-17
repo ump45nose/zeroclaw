@@ -909,10 +909,8 @@ impl Chat {
     /// or back to the agent picker when none remain. Returns false when the
     /// id is unknown.
     ///
-    /// Test-only since the focused-row `✕` was removed: no user-facing surface
-    /// closes a tracked session any more. An explicit session-management
-    /// surface should carry that intent, rather than the sidebar row.
-    #[cfg(test)]
+    /// The sidebar title's explicit `-` action is the only user-facing caller;
+    /// session rows remain focus-only to prevent accidental lifecycle actions.
     pub(crate) async fn close_session(&mut self, session_id: &str) -> bool {
         let was_focused = matches!(
             &self.phase,
@@ -13586,9 +13584,9 @@ mod tests {
 
     #[tokio::test]
     async fn ctrl_n_requests_additive_creation_without_replacing_the_focused_session() {
-        // Regression test for #10740. Ctrl+N is the keyboard form of the
-        // sidebar `[+]`, so it must ask the app for the add-session picker and
-        // leave the focused session tracked, instead of restarting it in place.
+        // This regression test keeps Ctrl+N aligned with the sidebar `[+]`.
+        // It must ask the app for the add-session picker and leave the focused
+        // session tracked, instead of restarting it in place.
         use crossterm::event::{KeyCode, KeyModifiers};
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));

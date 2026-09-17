@@ -1086,6 +1086,21 @@ pub async fn run(
                         }
                     }
                 }
+                crate::agent_sidebar::SidebarEvent::CloseSession { pane, session_id }
+                    if connected =>
+                {
+                    // The pane keeps the row until the daemon acknowledges the
+                    // close. The daemon cancels and fences an in-flight turn
+                    // before removing the live session; durable history stays.
+                    match pane {
+                        chat::PaneKind::Chat => {
+                            chat_pane.close_session(&session_id).await;
+                        }
+                        chat::PaneKind::Acp => {
+                            acp_pane.close_session(&session_id).await;
+                        }
+                    }
+                }
                 crate::agent_sidebar::SidebarEvent::OpenPicker if connected => {
                     // The picker adds to the pane you're in; other modes
                     // default to Chat.
