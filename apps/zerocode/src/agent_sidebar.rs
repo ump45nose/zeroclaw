@@ -100,6 +100,7 @@ pub(crate) struct AgentSidebar {
     plus_rect: Rect,
     quickstart_rect: Rect,
     row_rects: Vec<(PaneKind, String, Rect)>,
+    row_close_rects: Vec<(PaneKind, String, Rect)>,
     picker: Option<SidebarPicker>,
 }
 
@@ -118,6 +119,7 @@ impl AgentSidebar {
             plus_rect: Rect::default(),
             quickstart_rect: Rect::default(),
             row_rects: Vec::new(),
+            row_close_rects: Vec::new(),
             picker: None,
         }
     }
@@ -152,6 +154,7 @@ impl AgentSidebar {
         self.plus_rect = Rect::default();
         self.quickstart_rect = Rect::default();
         self.row_rects.clear();
+        self.row_close_rects.clear();
         if !self.visible {
             return (None, content);
         }
@@ -339,7 +342,16 @@ impl AgentSidebar {
                 .map(|s| crate::display_width::display_width(s) + 1)
                 .unwrap_or(0);
 
-            let name_width = (row_rect.width as usize).saturating_sub(2 + tag_width);
+            // Right-edge per-row close affordance (`✕`), restored alongside the
+            // Sessions-header `[-]` so a specific session can be closed without
+            // focusing it first. Skipped only when the row is too narrow.
+            let close_w: u16 = if row_rect.width >= 6 { 2 } else { 0 };
+            let content_rect = Rect {
+                width: row_rect.width.saturating_sub(close_w),
+                ..row_rect
+            };
+
+            let name_width = (content_rect.width as usize).saturating_sub(2 + tag_width);
             let duplicate = rows
                 .iter()
                 .filter(|row| row.agent_alias == summary.agent_alias)
@@ -377,9 +389,34 @@ impl AgentSidebar {
                 spans.push(Span::raw(" ".repeat(pad + 1)));
                 spans.push(Span::styled(label, theme::dim_style()));
             }
-            frame.render_widget(Paragraph::new(Line::from(spans)).style(row_style), row_rect);
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).style(row_style),
+                content_rect,
+            );
             self.row_rects
                 .push((summary.pane_kind, summary.session_id.clone(), row_rect));
+            if close_w > 0 {
+                let close_rect = Rect {
+                    x: content_rect.x + content_rect.width,
+                    y: row_rect.y,
+                    width: close_w,
+                    height: 1,
+                };
+                let close_style = if focused_here {
+                    theme::selection_highlight(true, true)
+                } else {
+                    theme::dim_style()
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled("\u{2715}", close_style)),
+                    close_rect,
+                );
+                self.row_close_rects.push((
+                    summary.pane_kind,
+                    summary.session_id.clone(),
+                    close_rect,
+                ));
+            }
         }
     }
 
@@ -531,8 +568,16 @@ impl AgentSidebar {
                 if mouse::in_rect(col, row, self.quickstart_rect) {
                     return Some(SidebarEvent::OpenQuickstart);
                 }
-                // Row clicks only move focus. There is no per-row lifecycle
-                // action: adding a session goes through the `[+]` picker.
+                // A per-row `✕` closes that specific session; the rest of
+                // the row only moves focus.
+                for (pane, sid, rect) in &self.row_close_rects {
+                    if mouse::in_rect(col, row, *rect) {
+                        return Some(SidebarEvent::CloseSession {
+                            pane: *pane,
+                            session_id: sid.clone(),
+                        });
+                    }
+                }
                 for (pane, sid, rect) in &self.row_rects {
                     if mouse::in_rect(col, row, *rect) {
                         return Some(SidebarEvent::FocusSession {
@@ -618,6 +663,7 @@ mod tests {
             plus_rect: Rect::default(),
             quickstart_rect: Rect::default(),
             row_rects: Vec::new(),
+            row_close_rects: Vec::new(),
             picker: None,
         }
     }
@@ -715,16 +761,25 @@ mod tests {
         );
         let (focused_pane, focused_sid, focused_row) = s.row_rects[0].clone();
         assert_eq!((focused_pane, focused_sid.as_str()), (PaneKind::Chat, "s1"));
-        for x in focused_row.x..focused_row.right() {
+        let (_, _, close_rect) = s.row_close_rects[0].clone();
+        for x in focused_row.x..close_rect.x {
             assert_eq!(
                 s.handle_mouse(&click(x, focused_row.y)),
                 Some(SidebarEvent::FocusSession {
                     pane: PaneKind::Chat,
                     session_id: "s1".into(),
                 }),
-                "no cell of a session row may close it (column {x})"
+                "row body cell must only focus (column {x})"
             );
         }
+        assert_eq!(
+            s.handle_mouse(&click(close_rect.x, close_rect.y)),
+            Some(SidebarEvent::CloseSession {
+                pane: PaneKind::Chat,
+                session_id: "s1".into(),
+            }),
+            "the per-row close affordance must close the focused session"
+        );
         assert_eq!(
             s.handle_mouse(&click(s.minus_rect.x, s.minus_rect.y)),
             Some(SidebarEvent::CloseSession {
@@ -832,11 +887,19 @@ mod tests {
             !text.contains("(42)"),
             "message counts are not session identity: {text}"
         );
-        // The trailing cells of a running row are not a close target: they only
-        // focus the session.
+        // The trailing close affordance closes the running session; the row
+        // body still only focuses.
         let (_, _, row) = sidebar.row_rects[0].clone();
+        let (_, _, close_rect) = sidebar.row_close_rects[0].clone();
         assert_eq!(
-            sidebar.handle_mouse(&click(row.right() - 1, row.y)),
+            sidebar.handle_mouse(&click(close_rect.x, close_rect.y)),
+            Some(SidebarEvent::CloseSession {
+                pane: PaneKind::Chat,
+                session_id: "s1".into(),
+            })
+        );
+        assert_eq!(
+            sidebar.handle_mouse(&click(row.x, row.y)),
             Some(SidebarEvent::FocusSession {
                 pane: PaneKind::Chat,
                 session_id: "s1".into(),
@@ -845,11 +908,10 @@ mod tests {
     }
 
     #[test]
-    fn no_row_exposes_a_close_target_in_any_row_state() {
-        // The focused row used to swap its pane tag for a clickable `✕`. Rows
-        // now carry focus and status only; this pins the absence of a close
-        // target for every row state so a lifecycle affordance cannot return
-        // unnoticed on the row cell.
+    fn every_row_exposes_a_close_target_alongside_focus() {
+        // Every row regained a clickable close affordance (alongside the
+        // Sessions-header `[-]`), so a specific session can be closed without
+        // focusing it first. The rest of each row still only moves focus.
         let mut sidebar = sidebar();
         let area = sidebar
             .carve(Rect::new(0, 0, SIDEBAR_COLS_MAX + CONTENT_MIN_COLS, 10))
@@ -875,28 +937,46 @@ mod tests {
         term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
             .unwrap();
 
-        let mut focused_seen = false;
-        for (row_index, (pane, sid, rect)) in sidebar.row_rects.clone().iter().enumerate() {
-            if *sid == "s-running" {
-                focused_seen = true;
-            }
-            for x in rect.x..rect.right() {
-                match sidebar.handle_mouse(&click(x, rect.y)) {
-                    Some(SidebarEvent::FocusSession {
-                        pane: hit_pane,
-                        session_id,
-                    }) => {
-                        assert_eq!(hit_pane, *pane, "row {row_index} hit the wrong pane");
-                        assert_eq!(session_id, *sid, "row {row_index} hit the wrong session");
+        // Every row - including the focused running one - exposes a close target.
+        let mut focused_close_seen = false;
+        for (pane, sid, rect) in sidebar.row_close_rects.clone().iter() {
+            match sidebar.handle_mouse(&click(rect.x, rect.y)) {
+                Some(SidebarEvent::CloseSession {
+                    pane: hit_pane,
+                    session_id,
+                }) => {
+                    assert_eq!(hit_pane, *pane, "{sid} close hit the wrong pane");
+                    assert_eq!(session_id, *sid, "{sid} close hit the wrong session");
+                    if sid == "s-running" {
+                        focused_close_seen = true;
                     }
-                    other => panic!("row {row_index} column {x} produced {other:?}"),
                 }
+                other => panic!("close target for {sid} produced {other:?}"),
             }
         }
-        assert!(
-            focused_seen,
-            "the focused row must be part of this coverage"
+        assert_eq!(
+            sidebar.row_close_rects.len(),
+            rows.len(),
+            "every row must expose a close target"
         );
+        assert!(
+            focused_close_seen,
+            "the focused running row must expose a close target"
+        );
+
+        // The row body still only focuses.
+        for (pane, sid, rect) in sidebar.row_rects.clone().iter() {
+            match sidebar.handle_mouse(&click(rect.x, rect.y)) {
+                Some(SidebarEvent::FocusSession {
+                    pane: hit_pane,
+                    session_id,
+                }) => {
+                    assert_eq!(hit_pane, *pane, "{sid} body hit the wrong pane");
+                    assert_eq!(session_id, *sid, "{sid} body hit the wrong session");
+                }
+                other => panic!("row body for {sid} produced {other:?}"),
+            }
+        }
     }
 
     #[test]

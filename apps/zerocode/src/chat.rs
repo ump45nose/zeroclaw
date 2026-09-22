@@ -1017,12 +1017,19 @@ impl Chat {
             if retained_was_focused {
                 self.resume_focused = None;
             }
-            // Closed the focused session: promote the next tracked one (sidebar
-            // order), else fall back to the agent picker.
+            // Closed the focused session: prefer the previously focused
+            // session (last_focused_sid) so focus returns where the user last
+            // was, else promote the next tracked one (sidebar order), else fall
+            // back to the agent picker.
             let next_idx = self
-                .session_order
-                .iter()
-                .find_map(|sid| self.background.iter().position(|s| &s.session_id == sid))
+                .last_focused_sid
+                .as_ref()
+                .and_then(|sid| self.background.iter().position(|s| &s.session_id == sid))
+                .or_else(|| {
+                    self.session_order
+                        .iter()
+                        .find_map(|sid| self.background.iter().position(|s| &s.session_id == sid))
+                })
                 .or_else(|| (!self.background.is_empty()).then_some(0));
             match next_idx {
                 Some(idx) => {
