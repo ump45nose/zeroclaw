@@ -14427,8 +14427,7 @@ mod tests {
             .map(|s| (s.session_id, s.focused))
             .collect();
         assert_eq!(
-            after,
-            before,
+            after, before,
             "Ctrl+N must preserve the tracked sessions and focus"
         );
         let ChatPhase::Active(state) = &chat.phase else {
