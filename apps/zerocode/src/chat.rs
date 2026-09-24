@@ -14426,12 +14426,19 @@ mod tests {
             .into_iter()
             .map(|s| (s.session_id, s.focused))
             .collect();
-        assert_eq!(after, before, "Ctrl+N must preserve the tracked sessions and focus");
+        assert_eq!(
+            after,
+            before,
+            "Ctrl+N must preserve the tracked sessions and focus"
+        );
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("Ctrl+N must leave the pane on its active session");
         };
         assert_eq!(state.session_id, "sess-a");
-        assert!(state.turn_in_flight, "opening the picker must not interrupt the running turn");
+        assert!(
+            state.turn_in_flight,
+            "opening the picker must not interrupt the running turn"
+        );
     }
 
     #[tokio::test]
