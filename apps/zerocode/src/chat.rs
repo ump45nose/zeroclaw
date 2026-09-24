@@ -14395,14 +14395,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ctrl_n_keeps_its_turn_in_flight_guard() {
-        // The chord keeps the guard it had before it became additive: the
-        // conversation is not swapped out from under a running turn. `[+]`
-        // stays the surface for that case.
+    async fn ctrl_n_opens_the_add_session_picker_during_a_running_turn() {
         use crossterm::event::{KeyCode, KeyModifiers};
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = two_session_chat(&rpc);
+        let before: Vec<_> = chat
+            .session_summaries()
+            .into_iter()
+            .map(|s| (s.session_id, s.focused))
+            .collect();
         let mut term = key_term();
         let ChatPhase::Active(state) = &mut chat.phase else {
             unreachable!()
@@ -14416,9 +14418,20 @@ mod tests {
         .await;
 
         assert!(
-            !chat.take_add_session_request(),
-            "a running turn still refuses the new-session chord"
+            chat.take_add_session_request(),
+            "Ctrl+N opens the additive picker even while a turn is running"
         );
+        let after: Vec<_> = chat
+            .session_summaries()
+            .into_iter()
+            .map(|s| (s.session_id, s.focused))
+            .collect();
+        assert_eq!(after, before, "Ctrl+N must preserve the tracked sessions and focus");
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("Ctrl+N must leave the pane on its active session");
+        };
+        assert_eq!(state.session_id, "sess-a");
+        assert!(state.turn_in_flight, "opening the picker must not interrupt the running turn");
     }
 
     #[tokio::test]
