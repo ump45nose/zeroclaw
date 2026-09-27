@@ -325,9 +325,8 @@ impl AgentSidebar {
             };
 
             // Every row shows the dim pane tag when the sidebar is wide enough.
-            // The focused row used to swap this tag for a `✕` close affordance;
-            // session rows now only carry focus and status, so no row performs a
-            // lifecycle action on click.
+            // The row body changes focus; the right-edge `✕` closes that row's
+            // session without changing focus first.
             let tag = if row_rect.width >= PANE_TAG_MIN_COLS {
                 let label = match summary.pane_kind {
                     PaneKind::Chat => t("zc-pane-chat"),

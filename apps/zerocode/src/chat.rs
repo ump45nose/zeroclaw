@@ -930,12 +930,13 @@ impl Chat {
     }
 
     /// Close one tracked session: the daemon drops it (history persists) and
-    /// the sidebar entry disappears. Focus moves to the next tracked session,
-    /// or back to the agent picker when none remain. Returns false when the
-    /// id is unknown.
+    /// the sidebar entry disappears. If the focused session closes, focus
+    /// returns to the previously focused session when available, otherwise to
+    /// the next tracked session or the agent picker. Returns false when the id
+    /// is unknown.
     ///
-    /// The sidebar title's explicit `-` action is the only user-facing caller;
-    /// session rows remain focus-only to prevent accidental lifecycle actions.
+    /// The Sessions-header `-` closes the focused session; a row `✕` closes
+    /// that row's session without requiring it to be focused first.
     pub(crate) async fn close_session(&mut self, session_id: &str) -> bool {
         let was_focused = matches!(
             &self.phase,
