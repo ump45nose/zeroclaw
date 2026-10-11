@@ -1,0 +1,15 @@
+A during turn: {"activeIsVisibleComposer":false,"active":"BODY \"Your browser is not suppo\"","composerDisabled":true}
+A after turn: {"activeIsVisibleComposer":true,"active":"TEXTAREA","composerDisabled":false}
+A composer value after typing with no click: "typed without clicking"
+B focus moved during turn: {"activeIsVisibleComposer":false,"active":"BUTTON \"Conversation 08dcb46f\"","composerDisabled":true}
+B after turn: {"activeIsVisibleComposer":false,"active":"BUTTON \"Conversation 08dcb46f\"","composerDisabled":false}
+C right after clicking Stop: {"activeIsVisibleComposer":false,"active":"BUTTON[Stop]","composerDisabled":true}
+C after stopped turn: {"activeIsVisibleComposer":true,"active":"TEXTAREA","composerDisabled":false}
+C composer value after typing with no click: "after stop"
+D textareas before/after new tab: 1/2
+D new tab, before hidden turn ends: {"activeIsVisibleComposer":false,"active":"BODY \"Your browser is not suppo\"","composerDisabled":false}
+D after hidden-pane turn ended: {"hiddenComposerFocused":false,"active":"BODY","composers":[{"visible":false,"disabled":false},{"visible":true,"disabled":false}]}
+E2 offline mid-turn: {"activeIsVisibleComposer":false,"active":"BODY \"Your browser is not suppo\"","composerDisabled":true} placeholder="Running…"
+E2 still offline after the server-side turn would have finished: {"activeIsVisibleComposer":false,"active":"BODY \"Your browser is not suppo\"","composerDisabled":true} placeholder="Running…"
+E2 after reconnect, composer enabled: {"activeIsVisibleComposer":true,"active":"TEXTAREA","composerDisabled":false}
+E2 composer value after typing with no click: "after reconnect"
