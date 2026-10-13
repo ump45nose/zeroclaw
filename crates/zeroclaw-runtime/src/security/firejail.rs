@@ -94,6 +94,7 @@ impl FirejailSandbox {
                 }
                 if CONFLICTING_EXTRA_ARGS.contains(&name)
                     || name.starts_with(PRIVATE_DEV_OVERRIDE_PREFIX)
+                    || arg == "--seccomp-error-action=log"
                 {
                     return Err(invalid(
                         "cli-security-firejail-args-error-conflict",
@@ -676,6 +677,36 @@ mod tests {
             assert!(
                 error.to_string().contains("firejail_args"),
                 "{bad:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn firejail_rejects_seccomp_log_action_that_allows_blocked_syscalls() {
+        for args in [
+            vec!["--seccomp-error-action=log"],
+            vec!["--net=none", "--seccomp-error-action=log"],
+            vec!["--seccomp-error-action=log", "--seccomp.block-secondary"],
+        ] {
+            let configured: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+            let error = FirejailSandbox::validate_extra_args(&configured).expect_err("log action");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("--seccomp-error-action"));
+        }
+    }
+
+    #[test]
+    fn firejail_accepts_seccomp_deny_actions_with_independent_restrictions() {
+        for action in ["kill", "EPERM"] {
+            let configured = [
+                "--net=none".to_string(),
+                "--seccomp.block-secondary".to_string(),
+                format!("--seccomp-error-action={action}"),
+            ];
+            let accepted = FirejailSandbox::validate_extra_args(&configured).unwrap();
+            assert_eq!(
+                accepted,
+                configured.iter().map(OsString::from).collect::<Vec<_>>()
             );
         }
     }
