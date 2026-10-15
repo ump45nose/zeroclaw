@@ -639,6 +639,41 @@ mod tests {
     }
 
     #[test]
+    fn queue_paused_hints_name_the_send_key_in_all_locales() {
+        use unicode_width::UnicodeWidthStr;
+
+        // An empty send resumes the queue on every terminal; the Alt chord
+        // types a character instead under macOS Terminal's default Option
+        // key, so the hints must name the send key.
+        let available_cells = 80 - crate::config::SidebarSection::default().width as usize - 2;
+        for (locale, source) in [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ] {
+            let bundle = build_ftl_bundle(source, locale);
+            for chord in ["Alt+p", "⌥P"] {
+                let args = [("key", chord), ("send", "Enter")];
+                let paused = format_ftl_message(&bundle, "zc-queue-paused-ghost", &args)
+                    .unwrap_or_else(|| panic!("paused hint must format for {locale}"));
+                assert!(paused.contains("Enter"), "{locale}: {paused}");
+                assert!(paused.contains(chord), "{locale}: {paused}");
+                let missing =
+                    format_ftl_message(&bundle, "zc-queue-missing-completion-ghost", &args)
+                        .unwrap_or_else(|| panic!("recovery hint must format for {locale}"));
+                assert!(missing.contains("Enter"), "{locale}: {missing}");
+                assert!(
+                    missing.width() <= available_cells,
+                    "{locale}/{chord}: {} cells exceed {available_cells}: {missing}",
+                    missing.width()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn missing_completion_hint_fits_default_queue_dock_in_all_locales() {
         use unicode_width::UnicodeWidthStr;
 
@@ -655,10 +690,10 @@ mod tests {
                 let hint = format_ftl_message(
                     &bundle,
                     "zc-queue-missing-completion-ghost",
-                    &[("key", chord)],
+                    &[("key", chord), ("send", "Enter")],
                 )
                 .unwrap_or_else(|| panic!("recovery hint must format for {locale}"));
-                assert!(hint.contains(chord), "{locale}: {hint}");
+                assert!(hint.contains("Enter"), "{locale}: {hint}");
                 assert!(
                     hint.width() <= available_cells,
                     "{locale}/{chord}: {} cells exceed {available_cells}: {hint}",

@@ -6390,7 +6390,10 @@ fn render_with_plan_placement(
                 Some(QueuePauseReason::MissingCompletion) => "zc-queue-missing-completion-ghost",
                 _ => "zc-queue-paused-ghost",
             },
-            &[("key", &resume_queue_chord_label())],
+            &[
+                ("key", &resume_queue_chord_label()),
+                ("send", &send_chord_label()),
+            ],
         ))
     } else {
         None
@@ -6534,6 +6537,16 @@ fn model_picker_overlay_area(model_picker: &ModelPickerOverlay, area: Rect) -> O
         }
         ModelPickerOverlay::None => None,
     }
+}
+
+/// Enter on an empty input bar resumes a paused queue on every terminal,
+/// unlike the Alt chord, which macOS Terminal types as a character by default.
+fn send_chord_label() -> String {
+    crate::keymap::InputBarAction::Submit
+        .default_chords()
+        .first()
+        .map(|c| c.display())
+        .unwrap_or_else(|| "Enter".to_string())
 }
 
 fn resume_queue_chord_label() -> String {
@@ -26987,6 +27000,45 @@ mod tests {
             .join("\n")
     }
 
+    #[tokio::test]
+    async fn paused_queue_hint_names_enter_in_rendered_input_bar() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // ⌥P types a character in macOS Terminal by default, so the paused
+        // hint must also name the empty-Enter resume that works anywhere.
+        let (mut chat, _writer_rx) = test_chat();
+        let mut paused = state();
+        paused.turn_in_flight = true;
+        paused
+            .enqueue_message("queued".to_string(), Vec::new())
+            .unwrap();
+        paused.commit_turn(String::new(), false);
+        assert!(paused.queue_paused());
+        chat.phase = ChatPhase::Active(Box::new(paused));
+
+        let hint = crate::i18n::t_args(
+            "zc-queue-paused-ghost",
+            &[
+                ("key", &resume_queue_chord_label()),
+                ("send", &send_chord_label()),
+            ],
+        );
+        assert!(hint.contains(&send_chord_label()), "{hint}");
+        assert!(hint.contains(&resume_queue_chord_label()), "{hint}");
+
+        let area = Rect::new(0, 0, 120, 24);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| chat.draw_with_dock(frame, area, None, None))
+            .unwrap();
+        let rendered = overlay_text(&terminal, area);
+        let row = rendered
+            .lines()
+            .find(|row| row.contains(&hint))
+            .unwrap_or_else(|| panic!("paused hint not rendered: {rendered}"));
+        println!("120x24 terminal cells: {}", row.trim_end());
+    }
+
     #[test]
     fn session_list_overlay_renders_memory_isolation_note() {
         use ratatui::{Terminal, backend::TestBackend};
@@ -30456,7 +30508,10 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
         let hint = crate::i18n::t_args(
             "zc-queue-missing-completion-ghost",
-            &[("key", &resume_queue_chord_label())],
+            &[
+                ("key", &resume_queue_chord_label()),
+                ("send", &send_chord_label()),
+            ],
         );
         let dock_width = crate::config::SidebarSection::default().width;
         for width in [80, 120] {
