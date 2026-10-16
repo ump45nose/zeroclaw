@@ -2285,25 +2285,56 @@ fn strip_channel_prompt_volatile_date_sections(prompt: &mut String) {
             .find("\n## ")
             .map(|i| content_start + i)
             .unwrap_or(prompt.len());
-        let heading = &prompt[start..content_start];
         let body = prompt[content_start..section_end].trim();
-        let generated = heading == LEGACY_CURRENT_DATE_TIME_HEADING
-            || body.starts_with(|c: char| c.is_ascii_digit());
-        if !generated {
+        if !is_generated_date_line(body) {
             // Non-date body under ## Current Date — leave it alone and stop
             // scanning older headings so we do not remove project notes.
             break;
         }
-        // Drop a leading blank line left behind when the section sat between
-        // other blocks.
-        let mut from = start;
-        if from >= 2 && &prompt[from - 2..from] == "\n\n" {
-            from -= 2;
-        } else if from >= 1 && prompt.as_bytes()[from - 1] == b'\n' {
-            from -= 1;
-        }
-        prompt.replace_range(from..section_end, "");
+        // Remove the section with the newline that ends it, so the next
+        // heading keeps the blank line in front of it. A section at the end
+        // of the prompt takes the newlines before it instead. Only ASCII
+        // '\n' bytes are stepped over, so the range stays on char boundaries.
+        let (from, to) = if section_end < prompt.len() {
+            (start, section_end + 1)
+        } else {
+            let mut from = start;
+            while from > 0 && prompt.as_bytes()[from - 1] == b'\n' {
+                from -= 1;
+            }
+            (from, section_end)
+        };
+        prompt.replace_range(from..to, "");
     }
+}
+
+/// True when `body` is exactly one date line as the prompt builders used to
+/// emit it: `YYYY-MM-DD (+HH:MM)` or the legacy `YYYY-MM-DD HH:MM:SS (TZ)`.
+/// Anything else (e.g. a workspace note that merely starts with a date) is
+/// project context and must survive the strip.
+fn is_generated_date_line(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    if body.contains('\n') || bytes.len() < 10 {
+        return false;
+    }
+    let date_ok = bytes[..10].iter().enumerate().all(|(i, b)| match i {
+        4 | 7 => *b == b'-',
+        _ => b.is_ascii_digit(),
+    });
+    if !date_ok {
+        return false;
+    }
+    let rest = &body[10..];
+    let Some(open) = rest.find(" (") else {
+        return false;
+    };
+    let time = &rest[..open];
+    let zone = &rest[open + 2..];
+    let time_ok = time.is_empty()
+        || (time.starts_with(' ')
+            && time.len() > 1
+            && time[1..].bytes().all(|b| b.is_ascii_digit() || b == b':'));
+    time_ok && zone.len() > 1 && zone.ends_with(')') && !zone[..zone.len() - 1].contains(['(', ')'])
 }
 
 fn find_latest_date_heading_before(prompt: &str, before: usize) -> Option<(usize, usize)> {
@@ -54736,6 +54767,43 @@ Done."#;
     }
 
     #[test]
+    fn build_channel_system_prompt_strips_date_after_multibyte_text() {
+        let prompt = build_channel_system_prompt(
+            "\u{e9}\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n",
+            "mattermost",
+            None,
+        );
+
+        assert!(prompt.starts_with('\u{e9}'));
+        assert!(!prompt.contains("## Current Date"));
+        assert!(!prompt.contains("2026-01-01 (+00:00)"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_keeps_dated_project_note() {
+        let prompt = build_channel_system_prompt(
+            "Base.\n\n## Current Date\n\n2026-10-16 is the project launch date.\n\n## Runtime\n\nHost: old\n",
+            "mattermost",
+            None,
+        );
+
+        assert!(prompt.contains("## Current Date\n\n2026-10-16 is the project launch date."));
+    }
+
+    #[test]
+    fn generated_date_line_matches_only_builder_output() {
+        assert!(is_generated_date_line("2026-01-01 (+00:00)"));
+        assert!(is_generated_date_line("2026-01-01 01:02:03 (UTC)"));
+        assert!(!is_generated_date_line(
+            "2026-10-16 is the project launch date."
+        ));
+        assert!(!is_generated_date_line("2026-01-01 (+00:00)\nmore notes"));
+        assert!(!is_generated_date_line(
+            "Project note, not generated date context."
+        ));
+    }
+
+    #[test]
     fn build_channel_system_prompt_strips_generated_current_date_section() {
         let prompt = build_channel_system_prompt(
             "Base.\n\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n",
@@ -54745,6 +54813,10 @@ Done."#;
 
         assert!(!prompt.contains("## Current Date"));
         assert!(!prompt.contains("2026-01-01 (+00:00)"));
+        assert!(
+            prompt.starts_with("Base.\n\n## Runtime\n"),
+            "next heading keeps its blank line: {prompt:?}"
+        );
         assert!(
             !prompt.contains(&chrono::Local::now().format("%Y-%m-%d").to_string()),
             "system prompt must not inject today's date (#11704): {prompt}"
