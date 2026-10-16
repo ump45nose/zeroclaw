@@ -2182,11 +2182,11 @@ fn build_channel_system_prompt(
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
-    // Date refresh stays in the system prompt: the heading is date-only
-    // (no seconds), so within a single day the rendered value is stable and
-    // cache hits; it only changes once per day at midnight. Acceptable for
-    // a 99%+ intra-session cache-hit rate.
-    refresh_channel_prompt_date_section(&mut prompt);
+    // Strip volatile date sections (#11704): the per-turn
+    // [turn-context] preamble already carries time/date/weekday/tz, and a
+    // ## Current Date value that changes at midnight busts the prompt cache
+    // for every live channel session (same reasoning as #10858).
+    strip_channel_prompt_volatile_date_sections(&mut prompt);
 
     if let Some(instructions) = channel_delivery_instructions(channel_name) {
         if prompt.is_empty() {
@@ -2267,28 +2267,41 @@ fn build_channel_system_prompt_for_message_with_signal(
     }
 }
 
-fn current_date_section() -> String {
-    let now = chrono::Local::now();
-    format!(
-        "{CURRENT_DATE_HEADING}{} ({})",
-        now.format("%Y-%m-%d"),
-        now.format("%:z")
-    )
-}
-
-fn refresh_channel_prompt_date_section(prompt: &mut String) {
-    let runtime_start = prompt
-        .find("\n## Runtime")
-        .map(|i| i + 1)
-        .unwrap_or(prompt.len());
-
-    if let Some((start, heading_len)) = find_latest_date_heading_before(prompt, runtime_start) {
+fn strip_channel_prompt_volatile_date_sections(prompt: &mut String) {
+    // Walk repeatedly so both ## Current Date and ## Current Date & Time
+    // are removed even when both appear. Keep a ## Current Date section
+    // whose body is not a generated date line (e.g. a project note).
+    loop {
+        let runtime_start = prompt
+            .find("\n## Runtime")
+            .map(|i| i + 1)
+            .unwrap_or(prompt.len());
+        let Some((start, heading_len)) = find_latest_date_heading_before(prompt, runtime_start) else {
+            break;
+        };
         let content_start = start + heading_len;
         let section_end = prompt[content_start..]
             .find("\n## ")
             .map(|i| content_start + i)
             .unwrap_or(prompt.len());
-        prompt.replace_range(start..section_end, &current_date_section());
+        let heading = &prompt[start..content_start];
+        let body = prompt[content_start..section_end].trim();
+        let generated = heading == LEGACY_CURRENT_DATE_TIME_HEADING
+            || body.starts_with(|c: char| c.is_ascii_digit());
+        if !generated {
+            // Non-date body under ## Current Date — leave it alone and stop
+            // scanning older headings so we do not remove project notes.
+            break;
+        }
+        // Drop a leading blank line left behind when the section sat between
+        // other blocks.
+        let mut from = start;
+        if from >= 2 && &prompt[from - 2..from] == "\n\n" {
+            from -= 2;
+        } else if from >= 1 && prompt.as_bytes()[from - 1] == b'\n' {
+            from -= 1;
+        }
+        prompt.replace_range(from..section_end, "");
     }
 }
 
@@ -36899,10 +36912,13 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("## Project Context"),
             "missing Project Context"
         );
-        assert!(prompt.contains("## Current Date"), "missing Date section");
+        assert!(
+            !prompt.contains("## Current Date"),
+            "system prompt must not carry wall-clock date (#11704)"
+        );
         assert!(
             !prompt.contains("## Current Date & Time"),
-            "prompt should use date-only context"
+            "prompt should not use datetime context"
         );
         assert!(prompt.contains("## Runtime"), "missing Runtime section");
     }
@@ -54701,7 +54717,7 @@ Done."#;
     }
 
     #[test]
-    fn build_channel_system_prompt_refreshes_legacy_datetime_section_to_date_only() {
+    fn build_channel_system_prompt_strips_legacy_datetime_keeps_project_note() {
         let prompt = build_channel_system_prompt(
             "Base.\n\n## Current Date\n\nProject note, not generated date context.\n\n## Current Date & Time\n\n2026-01-01 01:02:03 (UTC)\n\n## Runtime\n\nHost: old\n",
             "mattermost",
@@ -54712,43 +54728,25 @@ Done."#;
         assert!(prompt.contains("Project note, not generated date context."));
         assert!(!prompt.contains("## Current Date & Time"));
         assert!(!prompt.contains("01:02:03"));
-        let generated_section = prompt
-            .split("## Runtime")
-            .next()
-            .expect("prompt should contain runtime section before generated date assertion");
-        let date_line = generated_section
-            .rsplit("## Current Date\n\n")
-            .next()
-            .and_then(|rest| rest.lines().next())
-            .expect("current date section should have a date line");
-        assert_eq!(
-            &date_line[..10],
-            &chrono::Local::now().format("%Y-%m-%d").to_string()
-        );
         assert!(
-            date_line[10..].starts_with(" ("),
-            "date line should contain only date plus UTC offset: {date_line}"
+            !prompt.contains(&chrono::Local::now().format("%Y-%m-%d").to_string()),
+            "system prompt must not inject today's date (#11704): {prompt}"
         );
     }
 
     #[test]
-    fn build_channel_system_prompt_refreshes_current_date_section() {
+    fn build_channel_system_prompt_strips_generated_current_date_section() {
         let prompt = build_channel_system_prompt(
             "Base.\n\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n",
             "mattermost",
             None,
         );
 
-        assert!(prompt.contains("## Current Date\n\n"));
+        assert!(!prompt.contains("## Current Date"));
         assert!(!prompt.contains("2026-01-01 (+00:00)"));
-        let date_line = prompt
-            .split("## Current Date\n\n")
-            .nth(1)
-            .and_then(|rest| rest.lines().next())
-            .expect("current date section should have a date line");
-        assert_eq!(
-            &date_line[..10],
-            &chrono::Local::now().format("%Y-%m-%d").to_string()
+        assert!(
+            !prompt.contains(&chrono::Local::now().format("%Y-%m-%d").to_string()),
+            "system prompt must not inject today's date (#11704): {prompt}"
         );
     }
 
