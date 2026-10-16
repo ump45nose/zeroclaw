@@ -654,6 +654,23 @@ mod tests {
             ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
         ] {
             let bundle = build_ftl_bundle(source, locale);
+            let unbound = format_ftl_message(&bundle, "zc-queue-paused-no-key-ghost", &[])
+                .unwrap_or_else(|| panic!("unbound hint must format for {locale}"));
+            assert!(!unbound.is_empty());
+            assert!(unbound.width() <= available_cells, "{locale}: {unbound}");
+            for key in ["Enter", "F5", "F6", "Alt+p", "Option+p", "⌥P"] {
+                for id in [
+                    "zc-queue-paused-single-key-ghost",
+                    "zc-queue-missing-completion-single-key-ghost",
+                ] {
+                    let hint = format_ftl_message(&bundle, id, &[("key", key)])
+                        .unwrap_or_else(|| panic!("{id} must format for {locale}"));
+                    assert!(hint.contains(key), "{locale}/{id}: {hint}");
+                    if id == "zc-queue-missing-completion-single-key-ghost" {
+                        assert!(hint.width() <= available_cells, "{locale}/{key}: {hint}");
+                    }
+                }
+            }
             for chord in ["Alt+p", "⌥P"] {
                 let args = [("key", chord), ("send", "Enter")];
                 let paused = format_ftl_message(&bundle, "zc-queue-paused-ghost", &args)
