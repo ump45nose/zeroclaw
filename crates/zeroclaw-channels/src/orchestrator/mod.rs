@@ -2182,10 +2182,10 @@ fn build_channel_system_prompt(
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
-    // Strip volatile date sections (#11704): the per-turn
+    // Strip volatile date sections: the per-turn
     // [turn-context] preamble already carries time/date/weekday/tz, and a
     // ## Current Date value that changes at midnight busts the prompt cache
-    // for every live channel session (same reasoning as #10858).
+    // for every live channel session.
     strip_channel_prompt_volatile_date_sections(&mut prompt);
 
     if let Some(instructions) = channel_delivery_instructions(channel_name) {

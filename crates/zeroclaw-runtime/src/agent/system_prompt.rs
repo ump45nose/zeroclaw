@@ -508,7 +508,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         );
     }
 
-    // Date is NOT injected here (#11704 / #10858): wall-clock values bust
+    // Date is NOT injected here: wall-clock values bust
     // the prompt cache across midnight. The interactive agent::run loop
     // already prefixes each user message with [YYYY-MM-DD HH:MM:SS TZ].
 
