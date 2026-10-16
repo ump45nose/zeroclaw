@@ -2276,7 +2276,8 @@ fn strip_channel_prompt_volatile_date_sections(prompt: &mut String) {
             .find("\n## Runtime")
             .map(|i| i + 1)
             .unwrap_or(prompt.len());
-        let Some((start, heading_len)) = find_latest_date_heading_before(prompt, runtime_start) else {
+        let Some((start, heading_len)) = find_latest_date_heading_before(prompt, runtime_start)
+        else {
             break;
         };
         let content_start = start + heading_len;
