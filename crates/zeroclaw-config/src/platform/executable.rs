@@ -112,9 +112,9 @@ fn canonicalize_failure_message(program: &OsStr, candidate: &Path, error: &io::E
 
 /// When `canonicalize` fails with `PermissionDenied` on an absolute path (seen
 /// on Android for `/system/bin/sh`, where SELinux denies `open(O_PATH)` while
-/// `execve` still works — #12075), canonicalize the parent directory and join
-/// the final component. Reject symlinks: we cannot safely resolve them without
-/// opening the file.
+/// `execve` still works), canonicalize the parent directory and join the final
+/// component. Reject symlinks: we cannot safely resolve them without opening
+/// the file.
 #[cfg(unix)]
 fn canonicalize_absolute_via_parent(candidate: &Path) -> io::Result<PathBuf> {
     let file_name = candidate.file_name().ok_or_else(|| {
