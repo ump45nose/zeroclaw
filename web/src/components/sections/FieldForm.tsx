@@ -79,6 +79,7 @@ import {
 } from "./secretMap.logic";
 import { isLocalModelProviderName, primeModelProviderCatalog } from "../../lib/modelProviders";
 import EntityEnabledToggle from "../EntityEnabledToggle";
+import { syncAfterPersistedEnableToggle } from "./fieldForm.enableToggle.logic";
 
 function entryValue(entry: ListResponseEntry): unknown {
   return entry.populated ? entry.value : undefined;
@@ -1500,16 +1501,29 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                   // EntityEnabledToggle already persisted via patchConfig.
                   // Keep draft/baseline aligned so the save bar does not go
                   // dirty and write the pre-toggle value back (#12087).
-                  const nextStr = next ? "true" : "false";
+                  const synced = syncAfterPersistedEnableToggle({
+                    enabledPath: enabledEntry.path,
+                    nextEnabled: next,
+                    localDraft: draft,
+                    stagedDraftPaths: Object.keys(configDraft.drafts),
+                    entries: entries.map((e) => ({
+                      path: e.path,
+                      populated: e.populated,
+                      value: e.populated ? e.value : undefined,
+                    })),
+                  });
+                  const nextStr =
+                    synced.nextLocalDraft[enabledEntry.path] ?? (next ? "true" : "false");
                   setEntries((prev) =>
-                    prev.map((e) =>
-                      e.path === enabledEntry.path
-                        ? { ...e, value: next, populated: true }
-                        : e,
-                    ),
+                    prev.map((e) => {
+                      const updated = synced.nextEntries.find((x) => x.path === e.path);
+                      return updated
+                        ? { ...e, populated: updated.populated, value: updated.value }
+                        : e;
+                    }),
                   );
                   setDraft((d) => ({ ...d, [enabledEntry.path]: nextStr }));
-                  configDraft.clearDraft(enabledEntry.path);
+                  configDraft.clearDraft(synced.clearSharedDraftPath);
                 }}
               />
             )}
