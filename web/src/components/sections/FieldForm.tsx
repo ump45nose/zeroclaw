@@ -1497,6 +1497,10 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 prefix={prefix}
                 enabled={entryValue(enabledEntry) === "true"}
                 onChange={(next) => {
+                  // EntityEnabledToggle already persisted via patchConfig.
+                  // Keep draft/baseline aligned so the save bar does not go
+                  // dirty and write the pre-toggle value back (#12087).
+                  const nextStr = next ? "true" : "false";
                   setEntries((prev) =>
                     prev.map((e) =>
                       e.path === enabledEntry.path
@@ -1504,6 +1508,8 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                         : e,
                     ),
                   );
+                  setDraft((d) => ({ ...d, [enabledEntry.path]: nextStr }));
+                  configDraft.clearDraft(enabledEntry.path);
                 }}
               />
             )}
