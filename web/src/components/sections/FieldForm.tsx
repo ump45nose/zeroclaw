@@ -1514,13 +1514,22 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                   });
                   const nextStr =
                     synced.nextLocalDraft[enabledEntry.path] ?? (next ? "true" : "false");
+                  // Only refresh the enabled baseline. Applying every snapshotted
+                  // entry would clobber fields that were saved (and reloaded)
+                  // while the toggle request was still in flight (Greptile P1).
+                  const enabledBaseline = synced.nextEntries.find(
+                    (x) => x.path === enabledEntry.path,
+                  );
                   setEntries((prev) =>
-                    prev.map((e) => {
-                      const updated = synced.nextEntries.find((x) => x.path === e.path);
-                      return updated
-                        ? { ...e, populated: updated.populated, value: updated.value }
-                        : e;
-                    }),
+                    prev.map((e) =>
+                      e.path === enabledEntry.path && enabledBaseline
+                        ? {
+                            ...e,
+                            populated: enabledBaseline.populated,
+                            value: enabledBaseline.value,
+                          }
+                        : e,
+                    ),
                   );
                   setDraft((d) => ({ ...d, [enabledEntry.path]: nextStr }));
                   configDraft.clearDraft(synced.clearSharedDraftPath);
