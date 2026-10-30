@@ -2485,6 +2485,21 @@ struct StreamToolCallAccumulator {
     extra_content: Option<serde_json::Value>,
 }
 
+
+/// Resolve the tool-call slot for a streaming delta.
+///
+/// When `index` is present it is authoritative (OpenAI chat-completions).
+/// When it is missing, continue the last open call instead of allocating a
+/// new slot — some OpenAI-compatible local servers omit `index` on later
+/// argument fragments (#12081).
+fn stream_tool_call_delta_index(index: Option<usize>, open_calls: usize) -> usize {
+    match index {
+        Some(index) => index,
+        None if open_calls == 0 => 0,
+        None => open_calls - 1,
+    }
+}
+
 impl StreamToolCallAccumulator {
     fn apply_delta(&mut self, delta: &StreamToolCallDelta) {
         if let Some(id) = delta.id.as_ref().filter(|value| !value.is_empty()) {
@@ -2945,7 +2960,8 @@ fn sse_bytes_to_events_for_contract(
 
                             if let Some(deltas) = choice.delta.tool_calls.as_ref() {
                                 for delta in deltas {
-                                    let index = delta.index.unwrap_or(tool_calls.len());
+                                    let index =
+                                        stream_tool_call_delta_index(delta.index, tool_calls.len());
                                     if index >= tool_calls.len() {
                                         tool_calls.resize_with(index + 1, Default::default);
                                     }
@@ -13493,6 +13509,70 @@ mod tests {
         assert_eq!(tool_call.id, "call_1");
         assert_eq!(tool_call.name, "shell");
         assert_eq!(tool_call.arguments, r#"{"command":"date"}"#);
+    }
+
+    #[test]
+    fn stream_tool_call_delta_index_continues_last_when_omitted() {
+        assert_eq!(stream_tool_call_delta_index(None, 0), 0);
+        assert_eq!(stream_tool_call_delta_index(None, 1), 0);
+        assert_eq!(stream_tool_call_delta_index(None, 3), 2);
+        assert_eq!(stream_tool_call_delta_index(Some(1), 1), 1);
+        // Old unwrap_or(len) would have returned 1 here and opened a 2nd slot.
+        assert_ne!(stream_tool_call_delta_index(None, 1), 1);
+    }
+
+    #[test]
+    fn stream_tool_call_accumulator_keeps_args_when_index_omitted() {
+        // llama.cpp / some OpenAI-compatible servers omit `index` on later
+        // fragments and may put the first `{` on the same delta as `name`.
+        // Missing-index deltas must continue the open call (#12081).
+        let mut tool_calls: Vec<StreamToolCallAccumulator> = Vec::new();
+        let deltas = [
+            StreamToolCallDelta {
+                index: None,
+                id: Some("call_mem".to_string()),
+                function: Some(StreamFunctionDelta {
+                    name: Some("memory_store".to_string()),
+                    arguments: Some("{".to_string()),
+                }),
+                name: None,
+                arguments: None,
+                extra_content: None,
+            },
+            StreamToolCallDelta {
+                index: None,
+                id: None,
+                function: Some(StreamFunctionDelta {
+                    name: None,
+                    arguments: Some(
+                        r#""key":"dog_name","content":"My dog is named Biscuit.","category":"core"}"#
+                            .to_string(),
+                    ),
+                }),
+                name: None,
+                arguments: None,
+                extra_content: None,
+            },
+        ];
+        for delta in &deltas {
+            let index = stream_tool_call_delta_index(delta.index, tool_calls.len());
+            if index >= tool_calls.len() {
+                tool_calls.resize_with(index + 1, Default::default);
+            }
+            tool_calls[index].apply_delta(delta);
+        }
+        assert_eq!(tool_calls.len(), 1, "omitted index must not open a second call");
+        let mut used_tool_call_ids = std::collections::HashSet::new();
+        let tool_call = tool_calls
+            .pop()
+            .unwrap()
+            .into_provider_tool_call(false, &mut used_tool_call_ids)
+            .expect("accumulator should emit tool call");
+        assert_eq!(tool_call.name, "memory_store");
+        assert_eq!(
+            tool_call.arguments,
+            r#"{"key":"dog_name","content":"My dog is named Biscuit.","category":"core"}"#
+        );
     }
 
     #[test]
