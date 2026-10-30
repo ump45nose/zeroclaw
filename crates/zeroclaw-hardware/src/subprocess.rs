@@ -37,6 +37,9 @@ const SAFE_ENV_VARS: &[&str] = &[
     "USERPROFILE",
     "HOMEDRIVE",
     "HOMEPATH",
+    // Per-user config/cred/cache roots used by gh, npm, and most Win32 tools.
+    "APPDATA",
+    "LOCALAPPDATA",
     "SYSTEMROOT",
     "SYSTEMDRIVE",
     "WINDIR",
@@ -714,6 +717,19 @@ mod tests {
         let schema = tool.parameters_schema();
         let required = schema["required"].as_array().unwrap();
         assert!(required.is_empty());
+    }
+
+    #[test]
+    fn windows_profile_roots_stay_in_the_windows_allowlist_source() {
+        let source = include_str!("subprocess.rs");
+        assert!(
+            source.contains("\"APPDATA\""),
+            "Windows SAFE_ENV_VARS must forward APPDATA"
+        );
+        assert!(
+            source.contains("\"LOCALAPPDATA\""),
+            "Windows SAFE_ENV_VARS must forward LOCALAPPDATA"
+        );
     }
 
     #[test]

@@ -21,6 +21,9 @@ pub(crate) const SAFE_SHELL_ENV_VARS: &[&str] = &[
     "USERPROFILE",
     "HOMEDRIVE",
     "HOMEPATH",
+    // Per-user config/cred/cache roots used by gh, npm, and most Win32 tools.
+    "APPDATA",
+    "LOCALAPPDATA",
     "SYSTEMROOT",
     "SYSTEMDRIVE",
     "WINDIR",
@@ -64,5 +67,27 @@ mod tests {
     fn safe_shell_env_vars_preserve_powershell_module_discovery() {
         assert!(SAFE_SHELL_ENV_VARS.contains(&"PSModulePath"));
         assert!(SAFE_SHELL_ENV_VARS.contains(&"PSModuleAnalysisCachePath"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn safe_shell_env_vars_forward_windows_profile_roots() {
+        assert!(SAFE_SHELL_ENV_VARS.contains(&"APPDATA"));
+        assert!(SAFE_SHELL_ENV_VARS.contains(&"LOCALAPPDATA"));
+    }
+
+    #[test]
+    fn windows_profile_roots_stay_in_the_windows_allowlist_source() {
+        // Cross-platform guard: Linux CI still catches a regression that drops the
+        // Windows-only APPDATA / LOCALAPPDATA entries from this file.
+        let source = include_str!("shell_env.rs");
+        assert!(
+            source.contains("\"APPDATA\""),
+            "Windows SAFE_SHELL_ENV_VARS must forward APPDATA"
+        );
+        assert!(
+            source.contains("\"LOCALAPPDATA\""),
+            "Windows SAFE_SHELL_ENV_VARS must forward LOCALAPPDATA"
+        );
     }
 }
