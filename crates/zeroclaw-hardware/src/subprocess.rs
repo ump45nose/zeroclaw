@@ -29,8 +29,10 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-#[cfg(target_os = "windows")]
-const SAFE_ENV_VARS: &[&str] = &[
+/// Windows allowlist kept as a named slice so every platform's tests can assert
+/// APPDATA / LOCALAPPDATA without scanning this file's source.
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_SAFE_ENV_VARS: &[&str] = &[
     "PATH",
     "PATHEXT",
     "HOME",
@@ -51,6 +53,8 @@ const SAFE_ENV_VARS: &[&str] = &[
     "USERNAME",
 ];
 
+#[cfg(target_os = "windows")]
+const SAFE_ENV_VARS: &[&str] = WINDOWS_SAFE_ENV_VARS;
 pub struct SubprocessTool {
     /// Parsed plugin manifest (tool metadata + parameter definitions).
     manifest: ToolManifest,
@@ -719,15 +723,14 @@ mod tests {
         assert!(required.is_empty());
     }
 
-    #[test]
-    fn windows_profile_roots_stay_in_the_windows_allowlist_source() {
-        let source = include_str!("subprocess.rs");
+        #[test]
+    fn windows_profile_roots_stay_in_the_windows_allowlist() {
         assert!(
-            source.contains("\"APPDATA\""),
+            WINDOWS_SAFE_ENV_VARS.contains(&"APPDATA"),
             "Windows SAFE_ENV_VARS must forward APPDATA"
         );
         assert!(
-            source.contains("\"LOCALAPPDATA\""),
+            WINDOWS_SAFE_ENV_VARS.contains(&"LOCALAPPDATA"),
             "Windows SAFE_ENV_VARS must forward LOCALAPPDATA"
         );
     }

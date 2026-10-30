@@ -12,9 +12,11 @@ pub(crate) const SAFE_SHELL_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-/// Windows variables needed for cmd.exe, PowerShell module discovery, and program resolution.
-#[cfg(target_os = "windows")]
-pub(crate) const SAFE_SHELL_ENV_VARS: &[&str] = &[
+/// Windows allowlist kept as a named slice so every platform's tests can assert
+/// APPDATA / LOCALAPPDATA without scanning this file's source (tests also quote
+/// those names).
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) const WINDOWS_SAFE_SHELL_ENV_VARS: &[&str] = &[
     "PATH",
     "PATHEXT",
     "HOME",
@@ -37,6 +39,10 @@ pub(crate) const SAFE_SHELL_ENV_VARS: &[&str] = &[
     "LANG",
     "USERNAME",
 ];
+
+/// Windows variables needed for cmd.exe, PowerShell module discovery, and program resolution.
+#[cfg(target_os = "windows")]
+pub(crate) const SAFE_SHELL_ENV_VARS: &[&str] = WINDOWS_SAFE_SHELL_ENV_VARS;
 
 #[cfg(test)]
 mod tests {
@@ -77,16 +83,16 @@ mod tests {
     }
 
     #[test]
-    fn windows_profile_roots_stay_in_the_windows_allowlist_source() {
-        // Cross-platform guard: Linux CI still catches a regression that drops the
-        // Windows-only APPDATA / LOCALAPPDATA entries from this file.
-        let source = include_str!("shell_env.rs");
+    fn windows_profile_roots_stay_in_the_windows_allowlist() {
+        // Cross-platform: assert the Windows allowlist declaration directly so
+        // Linux CI still catches a regression that drops APPDATA / LOCALAPPDATA
+        // without matching the same strings inside this test module.
         assert!(
-            source.contains("\"APPDATA\""),
+            super::WINDOWS_SAFE_SHELL_ENV_VARS.contains(&"APPDATA"),
             "Windows SAFE_SHELL_ENV_VARS must forward APPDATA"
         );
         assert!(
-            source.contains("\"LOCALAPPDATA\""),
+            super::WINDOWS_SAFE_SHELL_ENV_VARS.contains(&"LOCALAPPDATA"),
             "Windows SAFE_SHELL_ENV_VARS must forward LOCALAPPDATA"
         );
     }
