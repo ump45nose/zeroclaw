@@ -13679,7 +13679,11 @@ mod tests {
             }
             tool_calls[index].apply_delta(delta);
         }
-        assert_eq!(tool_calls.len(), 2, "distinct ids without index stay separate");
+        assert_eq!(
+            tool_calls.len(),
+            2,
+            "distinct ids without index stay separate"
+        );
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let first = tool_calls
             .remove(0)
