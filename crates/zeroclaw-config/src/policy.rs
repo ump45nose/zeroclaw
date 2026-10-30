@@ -476,6 +476,12 @@ pub(crate) fn default_allowed_commands() -> Vec<String> {
 }
 
 /// Default forbidden paths for Unix platforms.
+///
+/// `/mnt`, `/media` and `/run/media` cover WSL DrvFs mounts (`/mnt/c`, …),
+/// removable volumes and udisks mounts so a Full-autonomy agent cannot roam
+/// Windows homes or other host volumes the Unix defaults would otherwise leave
+/// open. A more-specific workspace or `allowed_roots` entry under those trees
+/// still wins by depth.
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn default_forbidden_paths() -> Vec<String> {
     vec![
@@ -493,6 +499,9 @@ pub(crate) fn default_forbidden_paths() -> Vec<String> {
         "/sys".into(),
         "/var".into(),
         "/tmp".into(),
+        "/mnt".into(),
+        "/media".into(),
+        "/run/media".into(),
         "~/.ssh".into(),
         "~/.gnupg".into(),
         "~/.aws".into(),
@@ -501,9 +510,18 @@ pub(crate) fn default_forbidden_paths() -> Vec<String> {
 }
 
 /// Default forbidden paths for Windows platforms.
+///
+/// Every drive-letter root is denied by default so Full autonomy cannot roam
+/// non-system volumes or the system drive outside a more-specific workspace /
+/// `allowed_roots` entry. The legacy `C:\Windows` / Program Files spellings
+/// stay for equal-depth clarity with older configs. UNC shares are refused by
+/// [`path_is_unc`] in the path checkers when no allow entry matches.
 #[cfg(target_os = "windows")]
 pub(crate) fn default_forbidden_paths() -> Vec<String> {
-    vec![
+    let mut paths: Vec<String> = (b'A'..=b'Z')
+        .map(|letter| format!("{}:\\", letter as char))
+        .collect();
+    paths.extend([
         "C:\\Windows".into(),
         "C:\\Windows\\System32".into(),
         "C:\\Program Files".into(),
@@ -513,7 +531,38 @@ pub(crate) fn default_forbidden_paths() -> Vec<String> {
         "~/.gnupg".into(),
         "~/.aws".into(),
         "~/.config".into(),
-    ]
+    ]);
+    paths
+}
+
+/// True when `path` is a Windows UNC share (`\\server\share` / `//server/share`,
+/// including the `\\?\UNC\` long form).
+#[cfg(windows)]
+fn path_is_unc(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    let is_unc_prefix = text.len() >= 2
+        && ((bytes[0] == b'\\' && bytes[1] == b'\\') || (bytes[0] == b'/' && bytes[1] == b'/'));
+    if !is_unc_prefix {
+        return false;
+    }
+    let rest = &text[2..];
+    // `\\?\UNC\server\share`
+    if rest.len() >= 5
+        && rest.as_bytes()[0] == b'?'
+        && (rest.as_bytes()[1] == b'\\' || rest.as_bytes()[1] == b'/')
+        && rest[2..5].eq_ignore_ascii_case("UNC")
+    {
+        return true;
+    }
+    // Ordinary UNC: at least `\\server\share`
+    let mut parts = rest.split(['\\', '/']).filter(|part| !part.is_empty());
+    parts.next().is_some() && parts.next().is_some()
+}
+
+#[cfg(not(windows))]
+fn path_is_unc(_path: &Path) -> bool {
+    false
 }
 
 fn roots_contain(roots: &[PathBuf], expanded: &Path) -> bool {
@@ -4116,6 +4165,11 @@ impl SecurityPolicy {
             }
         }
 
+        // UNC shares stay outside Full autonomy unless an allow entry matched above.
+        if path_is_unc(&expanded_path) {
+            return false;
+        }
+
         true
     }
 
@@ -4197,6 +4251,10 @@ impl SecurityPolicy {
         )
         .is_some()
         {
+            return false;
+        }
+        // UNC shares stay outside Full autonomy unless an allow entry matched above.
+        if path_is_unc(resolved) {
             return false;
         }
         if !self.workspace_only {
@@ -4364,6 +4422,11 @@ impl SecurityPolicy {
         )
         .is_some()
         {
+            return false;
+        }
+
+        // UNC shares stay outside Full autonomy unless an allow entry matched above.
+        if path_is_unc(resolved) {
             return false;
         }
 
@@ -9187,7 +9250,18 @@ mod tests {
         let p = SecurityPolicy::default();
         #[cfg(not(target_os = "windows"))]
         {
-            for dir in ["/etc", "/root", "/proc", "/sys", "/dev", "/var", "/tmp"] {
+            for dir in [
+                "/etc",
+                "/root",
+                "/proc",
+                "/sys",
+                "/dev",
+                "/var",
+                "/tmp",
+                "/mnt",
+                "/media",
+                "/run/media",
+            ] {
                 assert!(
                     p.forbidden_paths.iter().any(|f| f == dir),
                     "Default forbidden_paths must include {dir} on Unix"

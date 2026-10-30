@@ -18880,6 +18880,17 @@ const FILESYSTEM_BROAD_ROOTS: [&str; 8] = [
     "/", "/home", "/etc", "/var", "/proc", "/sys", "/dev", "/tmp",
 ];
 
+/// WSL DrvFs mounts look like `/mnt/c`. Watching one is as broad as watching a
+/// Windows drive root; named bind mounts such as `/mnt/inbox` stay allowed.
+fn filesystem_path_is_drvfs_mnt_letter(path: &str) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    let Some(rest) = trimmed.strip_prefix("/mnt/") else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic()) && chars.next().is_none()
+}
+
 impl FilesystemConfig {
     /// Validate the filesystem listener configuration.
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -18892,6 +18903,11 @@ impl FilesystemConfig {
             if !self.allow_broad_roots && FILESYSTEM_BROAD_ROOTS.contains(&normalized) {
                 anyhow::bail!(
                     "path '{path}' is a broad system root; set allow_broad_roots = true to watch it"
+                );
+            }
+            if !self.allow_broad_roots && filesystem_path_is_drvfs_mnt_letter(normalized) {
+                anyhow::bail!(
+                    "path '{path}' is a WSL drive mount; set allow_broad_roots = true to watch it"
                 );
             }
         }
@@ -30747,6 +30763,40 @@ zeroclaw-operators = "operator"
             ..FilesystemConfig::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    async fn filesystem_validate_rejects_drvfs_mnt_letter_by_default() {
+        for root in ["/mnt/c", "/mnt/C/", "/mnt/d"] {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![root.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("WSL drive mount"),
+                "root {root} must be rejected by default: {err}"
+            );
+        }
+    }
+
+    #[test]
+    async fn filesystem_validate_allows_named_mnt_bind_and_drvfs_escape_hatch() {
+        let named = FilesystemConfig {
+            enabled: true,
+            paths: vec!["/mnt/inbox".into()],
+            ..FilesystemConfig::default()
+        };
+        assert!(named.validate().is_ok());
+
+        let escape = FilesystemConfig {
+            enabled: true,
+            paths: vec!["/mnt/c".into()],
+            allow_broad_roots: true,
+            ..FilesystemConfig::default()
+        };
+        assert!(escape.validate().is_ok());
     }
 
     #[test]
