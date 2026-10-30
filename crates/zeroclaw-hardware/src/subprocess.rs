@@ -723,7 +723,7 @@ mod tests {
         assert!(required.is_empty());
     }
 
-        #[test]
+    #[test]
     fn windows_profile_roots_stay_in_the_windows_allowlist() {
         assert!(
             WINDOWS_SAFE_ENV_VARS.contains(&"APPDATA"),
