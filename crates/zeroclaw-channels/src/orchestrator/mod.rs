@@ -46239,7 +46239,11 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent.len(), 1, "expected one operational reply, got {sent:?}");
+        assert_eq!(
+            sent.len(),
+            1,
+            "expected one operational reply, got {sent:?}"
+        );
         assert!(
             sent[0].suppress_voice,
             "runtime-command reply must suppress voice, got {:?}",
