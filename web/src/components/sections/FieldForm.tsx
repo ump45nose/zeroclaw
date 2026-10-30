@@ -79,7 +79,6 @@ import {
 } from "./secretMap.logic";
 import { isLocalModelProviderName, primeModelProviderCatalog } from "../../lib/modelProviders";
 import EntityEnabledToggle from "../EntityEnabledToggle";
-import { syncAfterPersistedEnableToggle } from "./fieldForm.enableToggle.logic";
 
 function entryValue(entry: ListResponseEntry): unknown {
   return entry.populated ? entry.value : undefined;
@@ -1498,41 +1497,16 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 prefix={prefix}
                 enabled={entryValue(enabledEntry) === "true"}
                 onChange={(next) => {
-                  // EntityEnabledToggle already persisted via patchConfig.
-                  // Keep draft/baseline aligned so the save bar does not go
-                  // dirty and write the pre-toggle value back (#12087).
-                  const synced = syncAfterPersistedEnableToggle({
-                    enabledPath: enabledEntry.path,
-                    nextEnabled: next,
-                    localDraft: draft,
-                    stagedDraftPaths: Object.keys(configDraft.drafts),
-                    entries: entries.map((e) => ({
-                      path: e.path,
-                      populated: e.populated,
-                      value: e.populated ? e.value : undefined,
-                    })),
-                  });
-                  const nextStr =
-                    synced.nextLocalDraft[enabledEntry.path] ?? (next ? "true" : "false");
-                  // Only refresh the enabled baseline. Applying every snapshotted
-                  // entry would clobber fields that were saved (and reloaded)
-                  // while the toggle request was still in flight (Greptile P1).
-                  const enabledBaseline = synced.nextEntries.find(
-                    (x) => x.path === enabledEntry.path,
-                  );
+                  const nextStr = next ? "true" : "false";
                   setEntries((prev) =>
                     prev.map((e) =>
-                      e.path === enabledEntry.path && enabledBaseline
-                        ? {
-                            ...e,
-                            populated: enabledBaseline.populated,
-                            value: enabledBaseline.value,
-                          }
+                      e.path === enabledEntry.path
+                        ? { ...e, populated: true, value: nextStr }
                         : e,
                     ),
                   );
                   setDraft((d) => ({ ...d, [enabledEntry.path]: nextStr }));
-                  configDraft.clearDraft(synced.clearSharedDraftPath);
+                  configDraft.clearDraft(enabledEntry.path);
                 }}
               />
             )}
