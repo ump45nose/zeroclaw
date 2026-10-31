@@ -269,7 +269,6 @@ fn ancestor_metadata_rules<'a>(roots: impl IntoIterator<Item = &'a Path>) -> Str
     rules
 }
 
-
 /// Escape a path so it is safe inside an SBPL `#"..."` regex literal.
 fn seatbelt_regex_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
@@ -1096,7 +1095,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn seatbelt_home_dotfile_allows_tools_and_denies_credentials() {
         if !SeatbeltSandbox::is_installed() {
@@ -1105,14 +1103,10 @@ mod tests {
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .expect("$HOME must be set for seatbelt integration fixtures");
-        let tool_dir = home.join(format!(
-            ".zeroclaw-seatbelt-tool-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let cred_dir = home.join(".ssh").join(format!(
-            "zeroclaw-seatbelt-cred-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let tool_dir = home.join(format!(".zeroclaw-seatbelt-tool-{}", uuid::Uuid::new_v4()));
+        let cred_dir = home
+            .join(".ssh")
+            .join(format!("zeroclaw-seatbelt-cred-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tool_dir).unwrap();
         std::fs::create_dir_all(&cred_dir).unwrap();
         let tool_file = tool_dir.join("marker.txt");
