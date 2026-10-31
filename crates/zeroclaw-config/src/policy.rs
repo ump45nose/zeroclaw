@@ -9175,22 +9175,41 @@ mod tests {
         }
         #[cfg(target_os = "windows")]
         {
+            let system_root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into());
+            let program_files =
+                std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+            let program_data =
+                std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
             for dir in [
-                "C:\\Windows",
-                "C:\\Windows\\System32",
-                "C:\\Program Files",
-                "C:\\ProgramData",
+                system_root.clone(),
+                format!(r"{system_root}\System32"),
+                program_files,
+                program_data,
             ] {
                 assert!(
-                    p.forbidden_paths.iter().any(|f| f == dir),
+                    p.forbidden_paths
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(&dir)),
                     "Default forbidden_paths must include {dir} on Windows"
                 );
                 assert!(
-                    !p.is_path_allowed(dir),
+                    !p.is_path_allowed(&dir),
                     "System dir should be blocked: {dir}"
                 );
             }
+            for dot in &["~/.ssh", "~/.aws"] {
+                assert!(
+                    p.forbidden_paths.iter().any(|f| f == *dot),
+                    "Default forbidden_paths must include {dot}"
+                );
+                assert!(
+                    !p.is_path_allowed(dot),
+                    "Sensitive dotfile dir should be blocked: {dot}"
+                );
+            }
+            assert!(!p.forbidden_paths.iter().any(|f| f == "~/.gnupg" || f == "~/.config"));
         }
+        #[cfg(not(target_os = "windows"))]
         for dot in &["~/.ssh", "~/.gnupg", "~/.aws"] {
             assert!(
                 p.forbidden_paths.iter().any(|f| f == dot),
@@ -9209,6 +9228,7 @@ mod tests {
             workspace_only: false,
             ..SecurityPolicy::default()
         };
+        #[cfg(not(target_os = "windows"))]
         for path in [
             "~/.ssh/id_rsa",
             "~/.gnupg/secring.gpg",
@@ -9219,6 +9239,29 @@ mod tests {
                 !p.is_path_allowed(path),
                 "Sensitive dotfile should be blocked: {path}"
             );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            for path in ["~/.ssh/id_rsa", "~/.aws/credentials"] {
+                assert!(
+                    !p.is_path_allowed(path),
+                    "Sensitive dotfile should be blocked: {path}"
+                );
+            }
+            let appdata = std::env::var("APPDATA")
+                .unwrap_or_else(|_| r"~/AppData/Roaming".into());
+            let local = std::env::var("LOCALAPPDATA")
+                .unwrap_or_else(|_| r"~/AppData/Local".into());
+            for path in [
+                format!(r"{appdata}\gnupg\secring.gpg"),
+                format!(r"{appdata}\secrets.toml"),
+                format!(r"{local}\Microsoft\Credentials\cred"),
+            ] {
+                assert!(
+                    !p.is_path_allowed(&path),
+                    "Sensitive profile path should be blocked: {path}"
+                );
+            }
         }
     }
 
@@ -9264,7 +9307,7 @@ mod tests {
         );
     }
 
-    #[test]
+        #[test]
     fn checklist_default_forbidden_paths_comprehensive() {
         let p = SecurityPolicy::default();
         #[cfg(not(target_os = "windows"))]
@@ -9275,25 +9318,51 @@ mod tests {
                     "Default forbidden_paths must include {dir} on Unix"
                 );
             }
-        }
-        #[cfg(target_os = "windows")]
-        {
-            for dir in [
-                "C:\\Windows",
-                "C:\\Windows\\System32",
-                "C:\\Program Files",
-                "C:\\ProgramData",
-            ] {
+            for dot in &["~/.ssh", "~/.gnupg", "~/.aws", "~/.config"] {
                 assert!(
-                    p.forbidden_paths.iter().any(|f| f == dir),
-                    "Default forbidden_paths must include {dir} on Windows"
+                    p.forbidden_paths.iter().any(|f| f == dot),
+                    "Default forbidden_paths must include {dot}"
                 );
             }
         }
-        for dot in &["~/.ssh", "~/.gnupg", "~/.aws", "~/.config"] {
+        #[cfg(target_os = "windows")]
+        {
+            // Prefer env-derived roots (relocated installs); English C:\… fallbacks
+            // still appear when the corresponding variable is unset.
+            let system_root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into());
+            let program_files =
+                std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+            let program_data =
+                std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+            for dir in [
+                system_root.clone(),
+                format!(r"{system_root}\System32"),
+                program_files,
+                program_data,
+            ] {
+                assert!(
+                    p.forbidden_paths
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(&dir)),
+                    "Default forbidden_paths must include {dir} on Windows"
+                );
+            }
+            // Unix ~/.gnupg / ~/.config are replaced by %APPDATA% / %LOCALAPPDATA% trees.
+            assert!(!p.forbidden_paths.iter().any(|f| f == "~/.gnupg" || f == "~/.config"));
+            for dot in &["~/.ssh", "~/.aws"] {
+                assert!(
+                    p.forbidden_paths.iter().any(|f| f == *dot),
+                    "Default forbidden_paths must include {dot}"
+                );
+            }
             assert!(
-                p.forbidden_paths.iter().any(|f| f == dot),
-                "Default forbidden_paths must include {dot}"
+                p.forbidden_paths.iter().any(|f| {
+                    f.ends_with(r"\gnupg")
+                        || f.ends_with("/gnupg")
+                        || f.ends_with(r"\Roaming\gnupg")
+                }),
+                "Windows defaults must forbid a gnupg profile tree, got {:?}",
+                p.forbidden_paths
             );
         }
     }
