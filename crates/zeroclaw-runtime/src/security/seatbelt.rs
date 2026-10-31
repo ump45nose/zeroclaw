@@ -671,7 +671,7 @@ mod tests {
             "SBPL must receive a single backslash-escaped dot under $HOME; policy={policy}"
         );
         assert!(
-            !policy.contains(r#"(regex #"^/Users/[^/]+"#),
+            !policy.contains(r##"(regex #"^/Users/[^/]+"##),
             "must not grant every account's home via /Users/[^/]+"
         );
         let ssh = seatbelt_string_literal(&home.join(".ssh").to_string_lossy());
