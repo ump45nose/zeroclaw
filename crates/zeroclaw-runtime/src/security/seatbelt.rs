@@ -269,6 +269,57 @@ fn ancestor_metadata_rules<'a>(roots: impl IntoIterator<Item = &'a Path>) -> Str
     rules
 }
 
+
+/// Escape a path so it is safe inside an SBPL `#"..."` regex literal.
+fn seatbelt_regex_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' | '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+/// Current-user home-dotfile read grant plus deny rules for the credential
+/// directories that grant would otherwise open. Scoped to `$HOME` so other
+/// accounts' homes are not readable. Seatbelt last-match wins: the denies
+/// follow the allow. Returns an empty string when `$HOME` is unset or not
+/// absolute (no blanket `/Users/[^/]+` fallback).
+fn home_dotfile_rules() -> String {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return String::new();
+    };
+    if !home.is_absolute() {
+        return String::new();
+    }
+
+    let home_re = seatbelt_regex_escape(&home.to_string_lossy());
+    // Raw string: a single `\.` reaches SBPL as an escaped literal dot.
+    let mut rules = format!(
+        r#"
+;; Allow reading the current user's home dotfiles for tool configs
+(allow file-read*
+    (regex #"^{home_re}/\."))
+"#
+    );
+
+    // Canonical home credential paths from default_forbidden_paths(). Emitting
+    // them here keeps Seatbelt aligned with the application-layer deny list
+    // when the broad home-dotfile grant would otherwise open them.
+    for name in [".ssh", ".gnupg", ".aws", ".config"] {
+        let path = home.join(name);
+        let literal = seatbelt_string_literal(&path.to_string_lossy());
+        rules.push_str(&format!("(deny file-read* (subpath \"{literal}\"))\n"));
+        rules.push_str(&format!("(deny file-write* (subpath \"{literal}\"))\n"));
+    }
+    rules
+}
+
 fn generate_policy(
     workspace: &Path,
     read_write: &[PathBuf],
@@ -338,9 +389,7 @@ fn generate_policy(
 (allow file-read*
     (regex #"^/private/var/folders/"))
 
-;; Allow reading user home for tool configs
-(allow file-read*
-    (regex #"^/Users/[^/]+\."))
+{home_dotfile_rules}
 
 ;; ── Filesystem writes ──────────────────────────────────────
 ;; Only allow writes to workspace and temp directories
@@ -393,6 +442,7 @@ fn generate_policy(
 (allow mach-task-name)
 "#,
         workspace = workspace_str,
+        home_dotfile_rules = home_dotfile_rules(),
     )
 }
 
@@ -472,7 +522,7 @@ mod tests {
     /// RAII fixture directory under the user's home directory.
     ///
     /// Deliberately NOT under the policy's broad `/tmp`, `/private/tmp`,
-    /// `/private/var/folders`, system, or hidden-dotfile (`^/Users/<name>/\.`)
+    /// `/private/var/folders`, system, or hidden-dotfile (`^$HOME/\.`)
     /// grants: a fixture the baseline policy can already touch would make the
     /// negative sibling assertions vacuous.
     struct HomeFixture {
@@ -605,18 +655,54 @@ mod tests {
     fn generate_policy_home_dotfile_regex_uses_single_sbpl_backslash() {
         // The SBPL profile is a Rust raw string. Emitting two backslashes before the
         // dot makes sandbox-exec see an escaped backslash plus "any character", so
-        // `~/.cargo` never matches. Emit a single escaped dot so the rule matches
-        // home dotfiles like Apple's profiles, without granting bare home paths.
+        // `~/.cargo` never matches. Emit a single escaped dot, scoped to $HOME, with
+        // a path boundary slash so `/Users/alice.smith/...` is not prefixed-matched.
+        let home = std::env::temp_dir().join("zeroclaw-seatbelt-home-dotfile-unit");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        // SAFETY: test-scoped HOME override; restored when `_home_guard` drops.
+        let _home_guard = EnvHomeGuard::set(&home);
         let workspace = PathBuf::from("/tmp/test");
         let policy = generate_policy(&workspace, &[], &[], &[]);
+        let home_re = seatbelt_regex_escape(&home.to_string_lossy());
+        let expected = format!(r##"(regex #"^{home_re}/\.")"##);
         assert!(
-            policy.contains("(regex #\"^/Users/[^/]+/\\.\")"),
-            "SBPL must receive a single backslash-escaped dot"
+            policy.contains(&expected),
+            "SBPL must receive a single backslash-escaped dot under $HOME; policy={policy}"
         );
         assert!(
-            !policy.contains("(regex #\"^/Users/[^/]+/\\\\.\")"),
-            "must not emit a double backslash before the dot"
+            !policy.contains(r#"(regex #"^/Users/[^/]+"#),
+            "must not grant every account's home via /Users/[^/]+"
         );
+        let ssh = seatbelt_string_literal(&home.join(".ssh").to_string_lossy());
+        assert!(
+            policy.contains(&format!(r#"(deny file-read* (subpath "{ssh}"))"#)),
+            "must deny the canonical ~/.ssh credential path"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// RAII `$HOME` override for unit tests that assert home-scoped Seatbelt rules.
+    struct EnvHomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvHomeGuard {
+        fn set(home: &Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            // SAFETY: tests in this module run single-threaded for HOME-dependent cases.
+            unsafe { std::env::set_var("HOME", home) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for EnvHomeGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var("HOME", value) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        }
     }
 
     #[test]
@@ -1008,6 +1094,51 @@ mod tests {
             !out.status.success(),
             "retargeted alias must not authorize an unlisted root"
         );
+    }
+
+
+    #[test]
+    fn seatbelt_home_dotfile_allows_tools_and_denies_credentials() {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("$HOME must be set for seatbelt integration fixtures");
+        let tool_dir = home.join(format!(
+            ".zeroclaw-seatbelt-tool-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cred_dir = home.join(".ssh").join(format!(
+            "zeroclaw-seatbelt-cred-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tool_dir).unwrap();
+        std::fs::create_dir_all(&cred_dir).unwrap();
+        let tool_file = tool_dir.join("marker.txt");
+        let cred_file = cred_dir.join("marker.txt");
+        std::fs::write(&tool_file, "tool-ok").unwrap();
+        std::fs::write(&cred_file, "secret").unwrap();
+
+        let workspace = HomeFixture::new("dotfile-ws").child("workspace");
+        let sandbox = SeatbeltSandbox::with_workspace(Some(&workspace)).unwrap();
+
+        let allow = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &tool_file);
+        assert!(
+            allow.status.success(),
+            "current-user home dotfile tool path must be readable: {}",
+            String::from_utf8_lossy(&allow.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&allow.stdout).trim_end(), "tool-ok");
+
+        let deny = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &cred_file);
+        assert!(
+            !deny.status.success(),
+            "canonical ~/.ssh credential path must stay denied"
+        );
+
+        let _ = std::fs::remove_dir_all(&tool_dir);
+        let _ = std::fs::remove_dir_all(&cred_dir);
     }
 
     #[test]
