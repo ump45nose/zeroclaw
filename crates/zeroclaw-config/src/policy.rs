@@ -663,7 +663,6 @@ fn path_starts_with_policy_prefix(path: &Path, prefix: &Path) -> bool {
 }
 
 fn roots_contain(roots: &[PathBuf], expanded: &Path) -> bool {
-
     roots.iter().any(|root| {
         let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
         expanded.starts_with(&canonical) || expanded.starts_with(root)
@@ -4211,8 +4210,7 @@ impl SecurityPolicy {
         }
 
         if expanded_path.is_absolute() {
-            let in_workspace =
-                path_starts_with_policy_prefix(&expanded_path, &self.workspace_dir);
+            let in_workspace = path_starts_with_policy_prefix(&expanded_path, &self.workspace_dir);
             let in_allowed_root = self
                 .allowed_roots
                 .iter()
@@ -10783,7 +10781,6 @@ mod tests {
 
     #[test]
     fn path_text_is_unc_distinguishes_local_extended_and_share_forms() {
-
         assert!(path_text_is_unc(r"\\server\share"));
         assert!(path_text_is_unc(r"\\server\share\file.txt"));
         assert!(path_text_is_unc("//server/share/file.txt"));
