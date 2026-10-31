@@ -9207,7 +9207,11 @@ mod tests {
                     "Sensitive dotfile dir should be blocked: {dot}"
                 );
             }
-            assert!(!p.forbidden_paths.iter().any(|f| f == "~/.gnupg" || f == "~/.config"));
+            assert!(
+                !p.forbidden_paths
+                    .iter()
+                    .any(|f| f == "~/.gnupg" || f == "~/.config")
+            );
         }
         #[cfg(not(target_os = "windows"))]
         for dot in &["~/.ssh", "~/.gnupg", "~/.aws"] {
@@ -9248,10 +9252,8 @@ mod tests {
                     "Sensitive dotfile should be blocked: {path}"
                 );
             }
-            let appdata = std::env::var("APPDATA")
-                .unwrap_or_else(|_| r"~/AppData/Roaming".into());
-            let local = std::env::var("LOCALAPPDATA")
-                .unwrap_or_else(|_| r"~/AppData/Local".into());
+            let appdata = std::env::var("APPDATA").unwrap_or_else(|_| r"~/AppData/Roaming".into());
+            let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| r"~/AppData/Local".into());
             for path in [
                 format!(r"{appdata}\gnupg\secring.gpg"),
                 format!(r"{appdata}\secrets.toml"),
@@ -9307,7 +9309,7 @@ mod tests {
         );
     }
 
-        #[test]
+    #[test]
     fn checklist_default_forbidden_paths_comprehensive() {
         let p = SecurityPolicy::default();
         #[cfg(not(target_os = "windows"))]
@@ -9348,7 +9350,11 @@ mod tests {
                 );
             }
             // Unix ~/.gnupg / ~/.config are replaced by %APPDATA% / %LOCALAPPDATA% trees.
-            assert!(!p.forbidden_paths.iter().any(|f| f == "~/.gnupg" || f == "~/.config"));
+            assert!(
+                !p.forbidden_paths
+                    .iter()
+                    .any(|f| f == "~/.gnupg" || f == "~/.config")
+            );
             for dot in &["~/.ssh", "~/.aws"] {
                 assert!(
                     p.forbidden_paths.iter().any(|f| f == *dot),
