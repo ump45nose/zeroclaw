@@ -1,5 +1,4 @@
-//! Regression coverage for default forbidden_paths covering WSL `/mnt` trees
-//! (zeroclaw-labs/zeroclaw#12134).
+//! Regression coverage for default forbidden_paths covering WSL `/mnt` trees.
 #![cfg(not(target_os = "windows"))]
 
 use std::path::{Path, PathBuf};
@@ -13,11 +12,17 @@ fn unix_defaults_forbid_mnt_media_and_run_media() {
     };
     assert!(!p.is_path_allowed("/home/alice/.ssh/id_rsa"));
     assert!(!p.is_resolved_path_readable(Path::new("/home/alice/.ssh/id_rsa")));
-    assert!(p.forbidden_path_argument("cat /home/alice/.ssh/id_rsa").is_some());
+    assert!(
+        p.forbidden_path_argument("cat /home/alice/.ssh/id_rsa")
+            .is_some()
+    );
 
     assert!(!p.is_path_allowed("/mnt/c/Users/alice/.ssh/id_rsa"));
     assert!(!p.is_resolved_path_readable(Path::new("/mnt/c/Users/alice/.ssh/id_rsa")));
-    assert!(p.forbidden_path_argument("cat /mnt/c/Users/alice/.ssh/id_rsa").is_some());
+    assert!(
+        p.forbidden_path_argument("cat /mnt/c/Users/alice/.ssh/id_rsa")
+            .is_some()
+    );
     assert!(!p.is_resolved_path_allowed(Path::new(
         "/mnt/c/Users/alice/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/run.bat"
     )));
@@ -35,7 +40,10 @@ fn adding_mnt_keeps_a_windows_side_workspace_usable() {
     // Defaults already include /mnt; workspace depth beats the broad entry.
     assert!(p.is_path_allowed("/mnt/c/Users/alice/src/proj/main.rs"));
     assert!(!p.is_path_allowed("/mnt/c/Users/alice/.ssh/id_rsa"));
-    assert!(p.forbidden_path_argument("cat /mnt/c/Users/alice/.ssh/id_rsa").is_some());
+    assert!(
+        p.forbidden_path_argument("cat /mnt/c/Users/alice/.ssh/id_rsa")
+            .is_some()
+    );
     // An operator allowlist under /mnt still wins by depth.
     p.allowed_roots.push(PathBuf::from("/mnt/share/inbox"));
     assert!(p.is_path_allowed("/mnt/share/inbox/report.csv"));

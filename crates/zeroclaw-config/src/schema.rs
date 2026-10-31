@@ -18887,8 +18887,41 @@ fn filesystem_path_is_drvfs_mnt_letter(path: &str) -> bool {
     let Some(rest) = trimmed.strip_prefix("/mnt/") else {
         return false;
     };
-    let mut chars = rest.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic()) && chars.next().is_none()
+    // Collapse `.` / empty segments so `/mnt/./c`, `/mnt//c`, and `/mnt/c/.`
+    // still count as the WSL drive root `/mnt/c`.
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                let _ = parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    matches!(
+        parts.as_slice(),
+        [letter]
+            if letter.len() == 1 && letter.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+    )
+}
+
+#[cfg(test)]
+mod filesystem_path_drvfs_tests {
+    use super::filesystem_path_is_drvfs_mnt_letter;
+
+    #[test]
+    fn normalizes_equivalent_spellings() {
+        assert!(filesystem_path_is_drvfs_mnt_letter("/mnt/c"));
+        assert!(filesystem_path_is_drvfs_mnt_letter("/mnt/c/"));
+        assert!(filesystem_path_is_drvfs_mnt_letter("/mnt/./c"));
+        assert!(filesystem_path_is_drvfs_mnt_letter("/mnt//c"));
+        assert!(filesystem_path_is_drvfs_mnt_letter("/mnt/c/."));
+        assert!(filesystem_path_is_drvfs_mnt_letter("/mnt/./c/."));
+        assert!(!filesystem_path_is_drvfs_mnt_letter("/mnt/c/Users"));
+        assert!(!filesystem_path_is_drvfs_mnt_letter("/mnt"));
+        assert!(!filesystem_path_is_drvfs_mnt_letter("/media/c"));
+    }
 }
 
 impl FilesystemConfig {
@@ -30812,6 +30845,7 @@ zeroclaw-operators = "operator"
         assert_eq!(cfg.max_content_bytes, Some(65536));
         assert_eq!(cfg.events.len(), 4);
     }
+
     use super::*;
     use std::ffi::OsString;
     #[cfg(unix)]

@@ -535,34 +535,66 @@ pub(crate) fn default_forbidden_paths() -> Vec<String> {
     paths
 }
 
-/// True when `path` is a Windows UNC share (`\\server\share` / `//server/share`,
+/// True when `text` names a Windows UNC share (`\\server\share` / `//server/share`,
 /// including the `\\?\UNC\` long form).
-#[cfg(windows)]
-fn path_is_unc(path: &Path) -> bool {
-    let text = path.to_string_lossy();
+///
+/// Local extended paths such as `\\?\D:\data\report.txt` are **not** UNC.
+/// Comparison is byte-oriented so malformed UTF-8 / emoji after `\\?\` cannot panic.
+fn path_text_is_unc(text: &str) -> bool {
     let bytes = text.as_bytes();
-    let is_unc_prefix = text.len() >= 2
-        && ((bytes[0] == b'\\' && bytes[1] == b'\\') || (bytes[0] == b'/' && bytes[1] == b'/'));
-    if !is_unc_prefix {
+    if bytes.len() < 2 {
         return false;
     }
-    let rest = &text[2..];
-    // `\\?\UNC\server\share`
-    if rest.len() >= 5
-        && rest.as_bytes()[0] == b'?'
-        && (rest.as_bytes()[1] == b'\\' || rest.as_bytes()[1] == b'/')
-        && rest[2..5].eq_ignore_ascii_case("UNC")
-    {
-        return true;
+    let unc_style =
+        (bytes[0] == b'\\' && bytes[1] == b'\\') || (bytes[0] == b'/' && bytes[1] == b'/');
+    if !unc_style {
+        return false;
     }
-    // Ordinary UNC: at least `\\server\share`
-    let mut parts = rest.split(['\\', '/']).filter(|part| !part.is_empty());
-    parts.next().is_some() && parts.next().is_some()
+    let rest = &bytes[2..];
+    // Device namespace `\\.\...` is not a network share.
+    if rest.len() >= 2 && rest[0] == b'.' && (rest[1] == b'\\' || rest[1] == b'/') {
+        return false;
+    }
+    // Extended path `\\?\...`
+    if rest.len() >= 2 && rest[0] == b'?' && (rest[1] == b'\\' || rest[1] == b'/') {
+        let after = &rest[2..];
+        // `\\?\UNC\server\share` (and `\\?\unc\...`)
+        if after.len() >= 3 && after[..3].eq_ignore_ascii_case(b"UNC") {
+            return after.len() == 3 || after.get(3).is_some_and(|b| *b == b'\\' || *b == b'/');
+        }
+        // `\\?\C:\...` and other local extended spellings are not UNC.
+        return false;
+    }
+    // Ordinary UNC: at least `\\server\share` (two non-empty components).
+    let mut components = 0usize;
+    let mut i = 0usize;
+    while i < rest.len() {
+        while i < rest.len() && (rest[i] == b'\\' || rest[i] == b'/') {
+            i += 1;
+        }
+        if i >= rest.len() {
+            break;
+        }
+        while i < rest.len() && rest[i] != b'\\' && rest[i] != b'/' {
+            i += 1;
+        }
+        components += 1;
+        if components >= 2 {
+            return true;
+        }
+    }
+    false
 }
 
-#[cfg(not(windows))]
-fn path_is_unc(_path: &Path) -> bool {
-    false
+fn path_is_unc(path: &Path) -> bool {
+    // `cfg!` keeps `path_text_is_unc` referenced on every target so non-Windows
+    // builds do not warn about an unused helper that Windows path checks need.
+    if cfg!(windows) {
+        path_text_is_unc(&path.to_string_lossy())
+    } else {
+        let _ = path;
+        false
+    }
 }
 
 fn roots_contain(roots: &[PathBuf], expanded: &Path) -> bool {
@@ -10650,5 +10682,23 @@ mod tests {
         );
         assert_eq!(attached_short_option_value("-f"), None);
         assert_eq!(attached_short_option_value("--long"), None);
+    }
+
+    #[test]
+    fn path_text_is_unc_distinguishes_local_extended_and_share_forms() {
+        assert!(path_text_is_unc(r"\\server\share"));
+        assert!(path_text_is_unc(r"\\server\share\file.txt"));
+        assert!(path_text_is_unc("//server/share/file.txt"));
+        assert!(path_text_is_unc(r"\\?\UNC\server\share"));
+        assert!(path_text_is_unc(r"\\?\unc\server\share\x"));
+        // Local extended device paths must stay allowed under custom policy.
+        assert!(!path_text_is_unc(r"\\?\D:\data\report.txt"));
+        assert!(!path_text_is_unc(r"\\?\C:\Users\alice"));
+        assert!(!path_text_is_unc(r"D:\data\report.txt"));
+        assert!(!path_text_is_unc(r"\\.\nul"));
+        // Multibyte after `\\?\` must not panic (char-boundary slice).
+        assert!(!path_text_is_unc("\\\\?\\💩"));
+        assert!(!path_text_is_unc(r"\\"));
+        assert!(!path_text_is_unc(r"\\server"));
     }
 }
