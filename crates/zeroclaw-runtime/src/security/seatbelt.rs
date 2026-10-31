@@ -340,7 +340,7 @@ fn generate_policy(
 
 ;; Allow reading user home for tool configs
 (allow file-read*
-    (regex #"^/Users/[^/]+/\\."))
+    (regex #"^/Users/[^/]+\."))
 
 ;; ── Filesystem writes ──────────────────────────────────────
 ;; Only allow writes to workspace and temp directories
@@ -599,6 +599,24 @@ mod tests {
         assert!(policy.contains("(subpath \"/usr\")"));
         assert!(policy.contains("(subpath \"/bin\")"));
         assert!(policy.contains("(subpath \"/System\")"));
+    }
+
+    #[test]
+    fn generate_policy_home_dotfile_regex_uses_single_sbpl_backslash() {
+        // The SBPL profile is a Rust raw string. Emitting two backslashes before the
+        // dot makes sandbox-exec see an escaped backslash plus "any character", so
+        // `~/.cargo` never matches. Emit a single escaped dot so the rule matches
+        // home dotfiles like Apple's profiles, without granting bare home paths.
+        let workspace = PathBuf::from("/tmp/test");
+        let policy = generate_policy(&workspace, &[], &[], &[]);
+        assert!(
+            policy.contains("(regex #\"^/Users/[^/]+/\\.\")"),
+            "SBPL must receive a single backslash-escaped dot"
+        );
+        assert!(
+            !policy.contains("(regex #\"^/Users/[^/]+/\\\\.\")"),
+            "must not emit a double backslash before the dot"
+        );
     }
 
     #[test]
