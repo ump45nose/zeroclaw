@@ -435,7 +435,7 @@ goto :end
 :add_zeroclaw_bin_to_user_path
 set "ZC_BIN=%USERPROFILE%\.zeroclaw\bin"
 set "ZC_PATH_RESULT="
-for /f "usebackq delims=" %%R in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$dst = $env:ZC_BIN; if ([string]::IsNullOrWhiteSpace($dst)) { $dst = Join-Path $env:USERPROFILE '.zeroclaw\bin' }; $e = [Environment]; $userPath = $e::GetEnvironmentVariable('Path', 'User'); if ($null -eq $userPath) { $userPath = '' }; if (($userPath -split ';' | Where-Object { $_ -ne '' }) -notcontains $dst) { $e::SetEnvironmentVariable('Path', (($dst + ';' + $userPath).TrimEnd(';')), 'User'); 'ADDED' } else { 'PRESENT' }"`) do set "ZC_PATH_RESULT=%%R"
+for /f "usebackq delims=" %%R in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$norm = { param($s) if ($null -eq $s) { return '' }; $t = ([string]$s).Trim().Trim([char]34); while ($t.EndsWith('\') -or $t.EndsWith('/')) { $t = $t.Substring(0, $t.Length - 1) }; $t }; $dst = & $norm $env:ZC_BIN; if ([string]::IsNullOrWhiteSpace($dst)) { $dst = & $norm (Join-Path $env:USERPROFILE '.zeroclaw\bin') }; $e = [Environment]; $userPath = $e::GetEnvironmentVariable('Path', 'User'); if ($null -eq $userPath) { $userPath = '' }; $parts = @($userPath -split ';' | Where-Object { $_ -ne '' }); $has = $false; foreach ($p in $parts) { if ((& $norm $p) -eq $dst) { $has = $true; break } }; if (-not $has) { $e::SetEnvironmentVariable('Path', (($dst + ';' + $userPath).TrimEnd(';')), 'User'); 'ADDED' } else { 'PRESENT' }"`) do set "ZC_PATH_RESULT=%%R"
 if /I "%ZC_PATH_RESULT%"=="ADDED" (
     echo   %GREEN%OK%RESET% Added to user PATH
 )
