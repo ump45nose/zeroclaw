@@ -213,8 +213,8 @@ version_gte() {
 }
 
 # Extract the package version from `zeroclaw --version` output.
-# After #11196 the line ends with a parenthesized build id, so the last
-# field is no longer the version (#12154). Field 2 is the package version
+# The line may end with a parenthesized build id, so the last field
+# is not always the version. Field 2 is the package version
 # for both the old and new formats.
 cli_package_version() {
   local line="$1"
